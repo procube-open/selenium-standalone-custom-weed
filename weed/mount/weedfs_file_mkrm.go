@@ -81,6 +81,7 @@ func (wfs *WFS) Mknod(cancel <-chan struct{}, in *fuse.MknodIn, name string, out
 			Signatures:               []int32{wfs.signature},
 			SkipCheckParentDirectory: true,
 		}
+		injectActorXAttrs(request.Entry)
 
 		glog.V(1).Infof("mknod: %v", request)
 		if err := filer_pb.CreateEntry(context.Background(), client, request); err != nil {

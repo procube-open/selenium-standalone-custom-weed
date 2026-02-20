@@ -138,6 +138,7 @@ func (wfs *WFS) flushFileMetadata(fh *FileHandle) error {
 			Signatures:               []int32{wfs.signature},
 			SkipCheckParentDirectory: true,
 		}
+		injectActorXAttrs(request.Entry)
 
 		wfs.mapPbIdFromLocalToFiler(request.Entry)
 		defer wfs.mapPbIdFromFilerToLocal(request.Entry)

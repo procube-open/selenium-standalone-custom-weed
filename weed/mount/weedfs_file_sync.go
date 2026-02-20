@@ -142,6 +142,7 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32) fuse.Status {
 			Signatures:               []int32{wfs.signature},
 			SkipCheckParentDirectory: true,
 		}
+		injectActorXAttrs(request.Entry)
 
 		glog.V(4).Infof("%s set chunks: %v", fileFullPath, len(entry.GetChunks()))
 		//for i, chunk := range entry.GetChunks() {

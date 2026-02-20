@@ -61,6 +61,7 @@ func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out
 			Signatures:               []int32{wfs.signature},
 			SkipCheckParentDirectory: true,
 		}
+		injectActorXAttrs(request.Entry)
 
 		glog.V(1).Infof("mkdir: %v", request)
 		if err := filer_pb.CreateEntry(context.Background(), client, request); err != nil {
