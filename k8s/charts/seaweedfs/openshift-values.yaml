@@ -11,11 +11,10 @@
 #
 # These overrides satisfy all four requirements by:
 #   1. Replacing hostPath volumes with PersistentVolumeClaims (or emptyDir for logs)
-#   2. Setting runAsUser: 1000 (the "seaweed" user baked into the image)
-#   3. Setting fsGroup: 1000 so Kubernetes pre-sets PVC ownership before the
-#      container starts — the entrypoint's chown -R is then skipped entirely
-#   4. Dropping all Linux capabilities and setting allowPrivilegeEscalation: false
-#   5. Enabling RuntimeDefault seccompProfile
+#   2. Enabling runAsNonRoot: true. By omitting runAsUser, OpenShift will
+#      automatically assign a valid UID from the namespace's allocated range.
+#   3. Dropping all Linux capabilities and setting allowPrivilegeEscalation: false
+#   4. Enabling RuntimeDefault seccompProfile
 #
 # Usage:
 #   helm install seaweedfs seaweedfs/seaweedfs \
@@ -24,15 +23,15 @@
 #
 # Adjust storageClass and sizes to match your cluster's available StorageClasses.
 # On OpenShift you can discover them with: oc get storageclass
-
-# ── Shared security context helpers ──────────────────────────────────────────
-# These are referenced in the per-component sections below.
-# If your OpenShift cluster assigns an arbitrary UID (as most do with the
-# "restricted" SCC), replace 1000 with the numeric UID in the range shown by:
-#   oc get project <namespace> -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.uid-range}'
-# and set the same value for runAsUser across all components.
-
+global:
+  enableReplication: true
+  #  replication type is XYZ:
+  # X number of replica in other data centers
+  # Y number of replica in other racks in the same data center
+  # Z number of replica in other servers in the same rack
+  replicationPlacement: "000" # no data replica
 master:
+  replicas: 1
   data:
     type: "persistentVolumeClaim"
     size: "10Gi"
@@ -43,9 +42,8 @@ master:
 
   podSecurityContext:
     enabled: true
-    runAsUser: 1000
-    runAsGroup: 1000
-    fsGroup: 1000           # Kubernetes sets PVC ownership to this GID before container start
+    # On OpenShift, we omit runAsUser/runAsGroup/fsGroup to let the admission
+    # controller assign them automatically based on the namespace's SCC.
     runAsNonRoot: true
 
   containerSecurityContext:
@@ -54,11 +52,11 @@ master:
     capabilities:
       drop: ["ALL"]
     runAsNonRoot: true
-    runAsUser: 1000
     seccompProfile:
       type: RuntimeDefault
 
 volume:
+  replicas: 1
   dataDirs:
     - name: data1
       type: "persistentVolumeClaim"
@@ -66,13 +64,13 @@ volume:
       storageClass: ""      # leave empty to use the cluster default StorageClass
       maxVolumes: 0
 
-  logs: {}                  # emptyDir by default (no logs section means no log volume)
+  logs:
+    type: "emptyDir"
 
   podSecurityContext:
     enabled: true
-    runAsUser: 1000
-    runAsGroup: 1000
-    fsGroup: 1000
+    # On OpenShift, we omit runAsUser/runAsGroup/fsGroup to let the admission
+    # controller assign them automatically based on the namespace's SCC.
     runAsNonRoot: true
 
   containerSecurityContext:
@@ -81,11 +79,11 @@ volume:
     capabilities:
       drop: ["ALL"]
     runAsNonRoot: true
-    runAsUser: 1000
     seccompProfile:
       type: RuntimeDefault
 
 filer:
+  replicas: 1
   data:
     type: "persistentVolumeClaim"
     size: "25Gi"
@@ -96,9 +94,8 @@ filer:
 
   podSecurityContext:
     enabled: true
-    runAsUser: 1000
-    runAsGroup: 1000
-    fsGroup: 1000
+    # On OpenShift, we omit runAsUser/runAsGroup/fsGroup to let the admission
+    # controller assign them automatically based on the namespace's SCC.
     runAsNonRoot: true
 
   containerSecurityContext:
@@ -107,18 +104,23 @@ filer:
     capabilities:
       drop: ["ALL"]
     runAsNonRoot: true
-    runAsUser: 1000
     seccompProfile:
       type: RuntimeDefault
 
 # S3 gateway (if enabled)
 s3:
+  enabled: true
+  replicas: 1
+  port: 8333
+  enableAuth: true
   podSecurityContext:
     enabled: true
-    runAsUser: 1000
-    runAsGroup: 1000
-    fsGroup: 1000
+    # On OpenShift, we omit runAsUser/runAsGroup/fsGroup to let the admission
+    # controller assign them automatically based on the namespace's SCC.
     runAsNonRoot: true
+
+  logs:
+    type: "emptyDir"
 
   containerSecurityContext:
     enabled: true
@@ -126,6 +128,5 @@ s3:
     capabilities:
       drop: ["ALL"]
     runAsNonRoot: true
-    runAsUser: 1000
     seccompProfile:
       type: RuntimeDefault

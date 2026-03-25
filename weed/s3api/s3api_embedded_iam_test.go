@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -20,9 +21,12 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/credential"
 	"github.com/seaweedfs/seaweedfs/weed/credential/memory"
 	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/policy_engine"
 	. "github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"github.com/seaweedfs/seaweedfs/weed/util/request_id"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -81,6 +85,10 @@ func NewEmbeddedIamApiForTest() *EmbeddedIamApiForTest {
 			return err
 		}
 		e.mockConfig = config
+		// Also refresh the IAM state so lookup functions see the updated configuration
+		if err := e.iam.LoadS3ApiConfigurationFromCredentialManager(); err != nil {
+			return err
+		}
 		return nil
 	}
 	return e
@@ -150,6 +158,15 @@ func extractEmbeddedIamErrorCodeAndMessage(response *httptest.ResponseRecorder) 
 	return "", ""
 }
 
+func extractEmbeddedIamRequestID(response *httptest.ResponseRecorder) string {
+	re := regexp.MustCompile(`<RequestId>([^<]+)</RequestId>`)
+	matches := re.FindStringSubmatch(response.Body.String())
+	if len(matches) < 2 {
+		return ""
+	}
+	return matches[1]
+}
+
 // TestEmbeddedIamCreateUser tests creating a user via the embedded IAM API
 func TestEmbeddedIamCreateUser(t *testing.T) {
 	api := NewEmbeddedIamApiForTest()
@@ -193,6 +210,8 @@ func TestEmbeddedIamListUsers(t *testing.T) {
 
 	// Verify response contains the users
 	assert.Len(t, out.ListUsersResult.Users, 2)
+	assert.NotEmpty(t, response.Header().Get(request_id.AmzRequestIDHeader))
+	assert.Equal(t, response.Header().Get(request_id.AmzRequestIDHeader), out.ResponseMetadata.RequestId)
 }
 
 // TestEmbeddedIamListAccessKeys tests listing access keys via the embedded IAM API
@@ -466,6 +485,46 @@ func TestEmbeddedIamAttachUserPolicy(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusOK, response.Code)
 	assert.Equal(t, []string{"TestManagedPolicy"}, api.mockConfig.Identities[0].PolicyNames)
+}
+
+func TestEmbeddedIamAttachUserPolicyRefreshesIAM(t *testing.T) {
+	api := NewEmbeddedIamApiForTest()
+	ctx := context.Background()
+	cm := api.credentialManager
+	user := &iam_pb.Identity{
+		Name: "policyRefreshUser",
+		Credentials: []*iam_pb.Credential{
+			{AccessKey: "REFRESHACCESS", SecretKey: "REFRESHSECRET"},
+		},
+	}
+	require.NoError(t, cm.CreateUser(ctx, user))
+	policy := policy_engine.PolicyDocument{
+		Version: policy_engine.PolicyVersion2012_10_17,
+		Statement: []policy_engine.PolicyStatement{
+			{
+				Effect:   policy_engine.PolicyEffectAllow,
+				Action:   policy_engine.NewStringOrStringSlice("s3:GetObject"),
+				Resource: policy_engine.NewStringOrStringSlicePtr("arn:aws:s3:::bucket/*"),
+			},
+		},
+	}
+	require.NoError(t, cm.PutPolicy(ctx, "RefreshPolicy", policy))
+	require.NoError(t, api.iam.LoadS3ApiConfigurationFromCredentialManager())
+
+	identity := api.iam.lookupByIdentityName("policyRefreshUser")
+	require.NotNil(t, identity)
+	assert.Empty(t, identity.PolicyNames)
+
+	values := url.Values{}
+	values.Set("UserName", "policyRefreshUser")
+	values.Set("PolicyArn", "arn:aws:iam:::policy/RefreshPolicy")
+
+	_, iamErr := api.AttachUserPolicy(ctx, values)
+	require.Nil(t, iamErr)
+
+	identity = api.iam.lookupByIdentityName("policyRefreshUser")
+	require.NotNil(t, identity)
+	assert.Equal(t, []string{"RefreshPolicy"}, identity.PolicyNames)
 }
 
 // TestEmbeddedIamAttachUserPolicyNoSuchPolicy tests attach failure when managed policy does not exist.
@@ -1168,6 +1227,9 @@ func TestEmbeddedIamNotImplementedAction(t *testing.T) {
 	apiRouter.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusNotImplemented, rr.Code)
+	assert.Contains(t, rr.Body.String(), "<RequestId>")
+	assert.NotContains(t, rr.Body.String(), "<ResponseMetadata>")
+	assert.Equal(t, rr.Header().Get(request_id.AmzRequestIDHeader), extractEmbeddedIamRequestID(rr))
 }
 
 // TestGetPolicyDocument tests parsing of policy documents
@@ -1852,11 +1914,11 @@ func TestEmbeddedIamExecuteAction(t *testing.T) {
 	vals.Set("Action", "CreateUser")
 	vals.Set("UserName", "ExecuteActionUser")
 
-	resp, iamErr := api.ExecuteAction(context.Background(), vals, false)
+	resp, iamErr := api.ExecuteAction(context.Background(), vals, false, "")
 	assert.Nil(t, iamErr)
 
 	// Verify response type
-	createResp, ok := resp.(iamCreateUserResponse)
+	createResp, ok := resp.(*iamCreateUserResponse)
 	assert.True(t, ok)
 	assert.Equal(t, "ExecuteActionUser", *createResp.CreateUserResult.User.UserName)
 

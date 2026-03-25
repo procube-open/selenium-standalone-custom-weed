@@ -31,6 +31,7 @@ type DiskLocation struct {
 	DirectoryUuid          string
 	IdxDirectory           string
 	DiskType               types.DiskType
+	Tags                   []string
 	MaxVolumeCount         int32
 	OriginalMaxVolumeCount int32
 	MinFreeSpace           util.MinFreeSpace
@@ -76,7 +77,7 @@ func writeNewUuid(fileName string) (string, error) {
 	return dirUuidString, nil
 }
 
-func NewDiskLocation(dir string, maxVolumeCount int32, minFreeSpace util.MinFreeSpace, idxDir string, diskType types.DiskType) *DiskLocation {
+func NewDiskLocation(dir string, maxVolumeCount int32, minFreeSpace util.MinFreeSpace, idxDir string, diskType types.DiskType, tags []string) *DiskLocation {
 	glog.V(4).Infof("Added new Disk %s: maxVolumes=%d", dir, maxVolumeCount)
 	dir = util.ResolvePath(dir)
 	if idxDir == "" {
@@ -88,11 +89,18 @@ func NewDiskLocation(dir string, maxVolumeCount int32, minFreeSpace util.MinFree
 	if err != nil {
 		glog.Fatalf("cannot generate uuid of dir %s: %v", dir, err)
 	}
+	// Defensive copy of tags to prevent external mutation
+	var copiedTags []string
+	if len(tags) > 0 {
+		copiedTags = make([]string, len(tags))
+		copy(copiedTags, tags)
+	}
 	location := &DiskLocation{
 		Directory:              dir,
 		DirectoryUuid:          dirUuid,
 		IdxDirectory:           idxDir,
 		DiskType:               diskType,
+		Tags:                   copiedTags,
 		MaxVolumeCount:         maxVolumeCount,
 		OriginalMaxVolumeCount: maxVolumeCount,
 		MinFreeSpace:           minFreeSpace,
@@ -164,6 +172,10 @@ func (l *DiskLocation) loadExistingVolume(dirEntry os.DirEntry, needleMapKind Ne
 	// skip if ec volumes exists, but validate EC files first
 	if skipIfEcVolumesExists {
 		ecxFilePath := filepath.Join(l.IdxDirectory, volumeName+".ecx")
+		if !util.FileExists(ecxFilePath) && l.IdxDirectory != l.Directory {
+			// .ecx may have been created before -dir.idx was configured
+			ecxFilePath = filepath.Join(l.Directory, volumeName+".ecx")
+		}
 		if util.FileExists(ecxFilePath) {
 			// Validate EC volume: shard count, size consistency, and expected size vs .dat file
 			if !l.validateEcVolume(collection, vid) {
@@ -288,9 +300,13 @@ func (l *DiskLocation) DeleteCollectionFromDiskLocation(collection string) (e er
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
-		for _, v := range delVolsMap {
+		for k, v := range delVolsMap {
 			if err := v.Destroy(false); err != nil {
 				errChain <- err
+			} else {
+				l.volumesLock.Lock()
+				delete(l.volumes, k)
+				l.volumesLock.Unlock()
 			}
 		}
 		wg.Done()
@@ -371,13 +387,9 @@ func (l *DiskLocation) UnloadVolume(vid needle.VolumeId) error {
 func (l *DiskLocation) unmountVolumeByCollection(collectionName string) map[needle.VolumeId]*Volume {
 	deltaVols := make(map[needle.VolumeId]*Volume, 0)
 	for k, v := range l.volumes {
-		if v.Collection == collectionName && !v.isCompacting && !v.isCommitCompacting {
+		if v.Collection == collectionName && !v.isCompactionInProgress.Load() {
 			deltaVols[k] = v
 		}
-	}
-
-	for k := range deltaVols {
-		delete(l.volumes, k)
 	}
 	return deltaVols
 }
