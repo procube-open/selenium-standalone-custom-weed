@@ -1,4 +1,4 @@
-FROM golang:1.24-bookworm AS seaweedfs-builder
+FROM golang:1.25-bookworm AS seaweedfs-builder
 
 WORKDIR /src/seaweedfs
 COPY go.mod /src/seaweedfs/go.mod

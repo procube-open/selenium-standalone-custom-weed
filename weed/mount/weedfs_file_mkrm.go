@@ -131,61 +131,6 @@ func (wfs *WFS) Mknod(cancel <-chan struct{}, in *fuse.MknodIn, name string, out
 		return
 	}
 
-	entryFullPath := dirFullPath.Child(name)
-	fileMode := toOsFileMode(in.Mode)
-	now := time.Now().Unix()
-	inode := wfs.inodeToPath.AllocateInode(entryFullPath, now)
-
-	newEntry := &filer_pb.Entry{
-		Name:        name,
-		IsDirectory: false,
-		Attributes: &filer_pb.FuseAttributes{
-			Mtime:    now,
-			Crtime:   now,
-			FileMode: uint32(fileMode),
-			Uid:      in.Uid,
-			Gid:      in.Gid,
-			TtlSec:   wfs.option.TtlSec,
-			Rdev:     in.Rdev,
-			Inode:    inode,
-		},
-	}
-
-	err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-
-		wfs.mapPbIdFromLocalToFiler(newEntry)
-		defer wfs.mapPbIdFromFilerToLocal(newEntry)
-
-		request := &filer_pb.CreateEntryRequest{
-			Directory:                string(dirFullPath),
-			Entry:                    newEntry,
-			Signatures:               []int32{wfs.signature},
-			SkipCheckParentDirectory: true,
-		}
-		injectActorXAttrs(request.Entry)
-
-		glog.V(1).Infof("mknod: %v", request)
-		if err := filer_pb.CreateEntry(context.Background(), client, request); err != nil {
-			glog.V(0).Infof("mknod %s: %v", entryFullPath, err)
-			return err
-		}
-
-		// Only cache the entry if the parent directory is already cached.
-		// This avoids polluting the cache with partial directory data.
-		if wfs.metaCache.IsDirectoryCached(dirFullPath) {
-			wfs.inodeToPath.TouchDirectory(dirFullPath)
-			if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry(request.Directory, request.Entry)); err != nil {
-				return fmt.Errorf("local mknod %s: %w", entryFullPath, err)
-			}
-		}
-
-		return nil
-	})
-
-	glog.V(3).Infof("mknod %s: %v", entryFullPath, err)
-
-	if err != nil {
-		return fuse.EIO
 	inode, newEntry, code := wfs.createRegularFile(dirFullPath, name, in.Mode, in.Uid, in.Gid, in.Rdev, false)
 	if code != fuse.OK {
 		return code
@@ -329,6 +274,7 @@ func (wfs *WFS) createRegularFile(dirFullPath util.FullPath, name string, mode u
 			Signatures:               []int32{wfs.signature},
 			SkipCheckParentDirectory: true,
 		}
+		injectActorXAttrs(request.Entry)
 
 		glog.V(1).Infof("createFile: %v", request)
 		resp, err := filer_pb.CreateEntryWithResponse(context.Background(), client, request)
