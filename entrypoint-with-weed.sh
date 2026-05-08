@@ -134,8 +134,7 @@ start_admingate_mounts() {
     -map.uid="${LOCAL_UID}:${FILER_UID}" \
     -map.gid="${LOCAL_GID}:${FILER_GID}" \
     -defaultPermissions="${DEFAULT_PERMISSIONS}" \
-    -umask="${UMASK_VALUE}" \
-    -volumeServerAccess=filerProxy &
+    -umask="${UMASK_VALUE}" &
   WEED_WORK_PID=$!
 
   /usr/local/bin/weed mount \
@@ -146,8 +145,7 @@ start_admingate_mounts() {
     -map.uid="${LOCAL_UID}:${FILER_UID}" \
     -map.gid="${LOCAL_GID}:${FILER_GID}" \
     -defaultPermissions="${DEFAULT_PERMISSIONS}" \
-    -umask="${UMASK_VALUE}" \
-    -volumeServerAccess=filerProxy &
+    -umask="${UMASK_VALUE}" &
   WEED_PUBLIC_PID=$!
 
   for _ in $(seq 1 20); do
