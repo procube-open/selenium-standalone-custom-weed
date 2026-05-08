@@ -115,32 +115,6 @@ func TestExpirePluginJobAPI(t *testing.T) {
 	})
 }
 
-func TestBuildJobSpecFromProposalDoesNotReuseProposalID(t *testing.T) {
-	t.Parallel()
-
-	proposal := &plugin_pb.JobProposal{
-		ProposalId: "vacuum-2",
-		DedupeKey:  "vacuum:2",
-		JobType:    "vacuum",
-	}
-
-	jobA := buildJobSpecFromProposal("vacuum", proposal, 0)
-	jobB := buildJobSpecFromProposal("vacuum", proposal, 1)
-
-	if jobA.JobId == proposal.ProposalId {
-		t.Fatalf("job id must not reuse proposal id: %s", jobA.JobId)
-	}
-	if jobB.JobId == proposal.ProposalId {
-		t.Fatalf("job id must not reuse proposal id: %s", jobB.JobId)
-	}
-	if jobA.JobId == jobB.JobId {
-		t.Fatalf("job ids must be unique across jobs: %s", jobA.JobId)
-	}
-	if jobA.DedupeKey != proposal.DedupeKey {
-		t.Fatalf("dedupe key must be preserved: got=%s want=%s", jobA.DedupeKey, proposal.DedupeKey)
-	}
-}
-
 func TestApplyDescriptorDefaultsToPersistedConfigBackfillsAdminDefaults(t *testing.T) {
 	t.Parallel()
 
@@ -218,5 +192,41 @@ func TestApplyDescriptorDefaultsToPersistedConfigReplacesBlankAdminScript(t *tes
 	}
 	if scriptKind.StringValue != "volume.fix.replication -apply" {
 		t.Fatalf("expected blank script to be replaced by default, got=%q", scriptKind.StringValue)
+	}
+}
+
+func TestFilterTrackedJobsByLane(t *testing.T) {
+	t.Parallel()
+
+	jobs := []plugin.TrackedJob{
+		{JobID: "vacuum-1", JobType: "vacuum"},
+		{JobID: "iceberg-1", JobType: "iceberg_maintenance"},
+		{JobID: "lifecycle-1", JobType: "s3_lifecycle"},
+	}
+
+	filtered := filterTrackedJobsByLane(jobs, "iceberg")
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 iceberg job, got %d", len(filtered))
+	}
+	if filtered[0].JobID != "iceberg-1" {
+		t.Fatalf("expected iceberg job to be retained, got %+v", filtered[0])
+	}
+}
+
+func TestFilterActivitiesByLane(t *testing.T) {
+	t.Parallel()
+
+	activities := []plugin.JobActivity{
+		{JobID: "vacuum-1", JobType: "vacuum"},
+		{JobID: "iceberg-1", JobType: "iceberg_maintenance"},
+		{JobID: "lifecycle-1", JobType: "s3_lifecycle"},
+	}
+
+	filtered := filterActivitiesByLane(activities, "lifecycle")
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 lifecycle activity, got %d", len(filtered))
+	}
+	if filtered[0].JobID != "lifecycle-1" {
+		t.Fatalf("expected lifecycle activity to be retained, got %+v", filtered[0])
 	}
 }

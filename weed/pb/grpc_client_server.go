@@ -2,9 +2,12 @@ package pb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
+	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,7 +29,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
-	"github.com/seaweedfs/seaweedfs/weed/pb/worker_pb"
 )
 
 const (
@@ -42,6 +44,25 @@ var (
 	// cache grpc connections
 	grpcClients     = make(map[string]*versionedGrpcClient)
 	grpcClientsLock sync.Mutex
+
+	// localGrpcSockets maps gRPC port numbers to Unix socket paths for
+	// gRPC services running in this process. Used by both the server side
+	// (to start serving on the socket) and the client side (to dial it
+	// instead of TCP for same-host RPCs).
+	localGrpcSockets = make(map[int]string)
+	// localGrpcHosts maps gRPC port → set of host strings that count as
+	// "this machine" for that port. Only dials whose target host is in this
+	// set are routed through the Unix socket; dials to other hosts that
+	// happen to use the same port number go over TCP as normal.
+	//
+	// Without this host check the hijack was keyed purely on port, so a
+	// remote server reusing one of our local gRPC ports (e.g. a standalone
+	// `weed volume -port=7334` defaulting `port.grpc=17334` against a
+	// `weed server` whose in-process volume socket is also on 17334) had
+	// its inbound RPCs silently rerouted to our local Unix socket — see
+	// issue #9254.
+	localGrpcHosts       = make(map[int]map[string]struct{})
+	localGrpcSocketsLock sync.RWMutex
 )
 
 type versionedGrpcClient struct {
@@ -53,6 +74,80 @@ type versionedGrpcClient struct {
 func init() {
 	http.DefaultTransport.(*http.Transport).MaxIdleConnsPerHost = 1024
 	http.DefaultTransport.(*http.Transport).MaxIdleConns = 1024
+}
+
+// RegisterLocalGrpcSocket registers a Unix socket path for a gRPC service
+// running on host:grpcPort in this process. After this is called, any
+// GrpcDial to host:grpcPort (or to a loopback alias of host on the same
+// port) is routed through the Unix socket. Dials to any other host on the
+// same port still go over TCP.
+func RegisterLocalGrpcSocket(host string, grpcPort int, socketPath string) {
+	localGrpcSocketsLock.Lock()
+	defer localGrpcSocketsLock.Unlock()
+	localGrpcSockets[grpcPort] = socketPath
+	hosts, ok := localGrpcHosts[grpcPort]
+	if !ok {
+		hosts = make(map[string]struct{})
+		localGrpcHosts[grpcPort] = hosts
+	}
+	// The advertised host plus the well-known loopback aliases all refer
+	// to "this machine"; the empty entry covers SplitHostPort outputs like
+	// ":17334".
+	for _, h := range []string{host, "", "localhost", "127.0.0.1", "::1"} {
+		hosts[h] = struct{}{}
+	}
+}
+
+// GetLocalGrpcSocket returns the Unix socket path for a gRPC port, or empty if not registered.
+func GetLocalGrpcSocket(grpcPort int) string {
+	localGrpcSocketsLock.RLock()
+	defer localGrpcSocketsLock.RUnlock()
+	return localGrpcSockets[grpcPort]
+}
+
+// resolveLocalGrpcSocket returns the Unix socket path to use for an outgoing
+// gRPC dial, or empty if the dial should go over TCP. It matches both the
+// host and the port: a remote peer that happens to reuse a local service's
+// gRPC port must not be rerouted to the local socket (issue #9254).
+func resolveLocalGrpcSocket(address string) string {
+	host, portStr, err := net.SplitHostPort(address)
+	if err != nil {
+		return ""
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return ""
+	}
+	localGrpcSocketsLock.RLock()
+	defer localGrpcSocketsLock.RUnlock()
+	if _, ok := localGrpcHosts[port][host]; !ok {
+		return ""
+	}
+	return localGrpcSockets[port]
+}
+
+// ServeGrpcOnLocalSocket starts serving a gRPC server on a Unix socket
+// if one is registered for the given port.
+func ServeGrpcOnLocalSocket(grpcServer *grpc.Server, grpcPort int) {
+	socketPath := GetLocalGrpcSocket(grpcPort)
+	if socketPath == "" {
+		return
+	}
+	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+		glog.Warningf("Failed to remove old gRPC socket %s: %v", socketPath, err)
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		glog.Errorf("Failed to listen on gRPC Unix socket %s: %v", socketPath, err)
+		return
+	}
+	glog.V(0).Infof("gRPC also listening on Unix socket %s", socketPath)
+	go func() {
+		if err := grpcServer.Serve(listener); err != nil && err != grpc.ErrServerStopped {
+			glog.Errorf("gRPC Unix socket server error on %s: %v", socketPath, err)
+		}
+		os.Remove(socketPath)
+	}()
 }
 
 func NewGrpcServer(opts ...grpc.ServerOption) *grpc.Server {
@@ -96,6 +191,14 @@ func NewGrpcServer(opts ...grpc.ServerOption) *grpc.Server {
 //     WARNING: This is NOT thread-safe, and mutates global resolver state affecting all grpc.NewClient calls in the process.
 func GrpcDial(ctx context.Context, address string, waitForReady bool, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
 	var options []grpc.DialOption
+
+	// Route through Unix socket if one is registered for this address's port
+	if socketPath := resolveLocalGrpcSocket(address); socketPath != "" {
+		options = append(options, grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", socketPath)
+		}))
+	}
 
 	options = append(options,
 		grpc.WithDefaultCallOptions(
@@ -179,9 +282,77 @@ func requestIDUnaryInterceptor() grpc.UnaryServerInterceptor {
 	}
 }
 
+// InvalidateGrpcConnection drops any cached gRPC ClientConn for the given
+// address. Use when a higher-level signal (for example a streaming master
+// connection detecting its peer has died) indicates the cached channel is
+// stale, even though gRPC itself may still believe the channel is healthy.
+// Silently returns if no cached connection exists.
+func InvalidateGrpcConnection(address string) {
+	grpcClientsLock.Lock()
+	vgc, ok := grpcClients[address]
+	if ok {
+		delete(grpcClients, address)
+	}
+	grpcClientsLock.Unlock()
+	if ok {
+		glog.V(1).Infof("Invalidating cached gRPC connection to %s", address)
+		vgc.Close()
+	}
+}
+
+// grpcMarshalErrorPrefix is the library-owned prefix gRPC prepends to every
+// client-side proto marshal failure; see grpc-go rpc_util.go encode():
+//   status.Errorf(codes.Internal, "grpc: error while marshaling: %v", ...)
+// The "grpc:" token is reserved for gRPC internal diagnostics and will not
+// collide with user-produced Internal statuses.
+const grpcMarshalErrorPrefix = "grpc: error while marshaling"
+
+// grpcStatusError is the minimal interface every gRPC status error satisfies.
+// Using it with errors.As lets us reach through arbitrary fmt.Errorf("...: %w")
+// wrapping to pull out the *original* gRPC Status — important because
+// status.FromError rewrites Status.Message with the outermost err.Error()
+// whenever it has to unwrap, which would defeat a prefix check on the
+// library-owned message.
+type grpcStatusError interface{ GRPCStatus() *status.Status }
+
+// isClientSideMarshalError reports whether err originates from gRPC failing to
+// marshal the outgoing request on the client side. These errors are surfaced
+// with codes.Internal (because gRPC has no better code for them) but do NOT
+// reflect a problem with the TCP/HTTP2 connection: the request never left the
+// process. Tearing down the shared cached ClientConn in response would cancel
+// every other in-flight RPC on that connection — which is exactly the cascade
+// seen in seaweedfs#9139 when a single file with invalid-UTF-8 bytes in its
+// name produces an avalanche of "connection is closing" errors on unrelated
+// LookupEntry / ReadDirAll / UpdateEntry calls.
+//
+// errors.Is against a proto-level sentinel is not viable: gRPC's encode()
+// collapses the inner proto error with "%v" before wrapping it in a Status,
+// so the original error type does not survive. The structural signal that
+// *does* survive is the Status itself — we recover it via errors.As and
+// match the library-owned "grpc:" prefix to disambiguate from a server-side
+// application Internal status that genuinely warrants invalidation.
+func isClientSideMarshalError(err error) bool {
+	var gse grpcStatusError
+	if !errors.As(err, &gse) {
+		return false
+	}
+	s := gse.GRPCStatus()
+	if s == nil {
+		return false
+	}
+	return s.Code() == codes.Internal && strings.HasPrefix(s.Message(), grpcMarshalErrorPrefix)
+}
+
 // shouldInvalidateConnection checks if an error indicates the cached connection should be invalidated
 func shouldInvalidateConnection(err error) bool {
 	if err == nil {
+		return false
+	}
+
+	// Client-side marshal errors (e.g. invalid UTF-8 in a proto string field)
+	// are per-request bugs, not connection failures. Do not poison the shared
+	// ClientConn because of them.
+	if isClientSideMarshalError(err) {
 		return false
 	}
 
@@ -215,50 +386,45 @@ func WithGrpcClient(streamingMode bool, signature int32, fn func(*grpc.ClientCon
 			return fmt.Errorf("getOrCreateConnection %s: %v", address, err)
 		}
 		executionErr := fn(vgc.ClientConn)
-		if executionErr != nil {
-			if shouldInvalidateConnection(executionErr) {
-				grpcClientsLock.Lock()
-				if t, ok := grpcClients[address]; ok {
-					if t.version == vgc.version {
-						glog.V(1).Infof("Removing cached gRPC connection to %s due to error: %v", address, executionErr)
-						vgc.Close()
-						delete(grpcClients, address)
-					}
-				}
-				grpcClientsLock.Unlock()
+		if executionErr != nil && shouldInvalidateConnection(executionErr) {
+			grpcClientsLock.Lock()
+			t, ok := grpcClients[address]
+			shouldClose := ok && t.version == vgc.version
+			if shouldClose {
+				delete(grpcClients, address)
+			}
+			grpcClientsLock.Unlock()
+			if shouldClose {
+				glog.V(1).Infof("Removing cached gRPC connection to %s due to error: %v", address, executionErr)
+				vgc.Close()
 			}
 		}
 		return executionErr
-	} else {
-		ctx := context.Background()
-		if signature != 0 {
-			// Optimize: Use AppendToOutgoingContext instead of creating new map
-			ctx = metadata.AppendToOutgoingContext(ctx, "sw-client-id", fmt.Sprintf("%d", signature))
-		}
-		grpcConnection, err := GrpcDial(ctx, address, waitForReady, opts...)
-		if err != nil {
-			return fmt.Errorf("fail to dial %s: %v", address, err)
-		}
-		defer grpcConnection.Close()
-		executionErr := fn(grpcConnection)
-		if executionErr != nil {
-			return executionErr
-		}
-		return nil
 	}
 
-}
-
-func ParseServerAddress(server string, deltaPort int) (newServerAddress string, err error) {
-
-	host, port, parseErr := hostAndPort(server)
-	if parseErr != nil {
-		return "", fmt.Errorf("server port parse error: %w", parseErr)
+	// Streaming mode: dedicate a fresh ClientConn to this call.
+	ctx := context.Background()
+	if signature != 0 {
+		// Optimize: Use AppendToOutgoingContext instead of creating new map
+		ctx = metadata.AppendToOutgoingContext(ctx, "sw-client-id", fmt.Sprintf("%d", signature))
 	}
-
-	newPort := int(port) + deltaPort
-
-	return util.JoinHostPort(host, newPort), nil
+	grpcConnection, err := GrpcDial(ctx, address, waitForReady, opts...)
+	if err != nil {
+		return fmt.Errorf("fail to dial %s: %v", address, err)
+	}
+	defer grpcConnection.Close()
+	executionErr := fn(grpcConnection)
+	if executionErr != nil {
+		// The streaming channel is dedicated to this caller, but unrelated
+		// request-path callers share a cached non-streaming ClientConn to the
+		// same peer. When the stream fails, drop that cached channel so the
+		// next caller dials fresh: this recovers cases where a stable L4
+		// endpoint (k8s Service VIP, external LB) hides a peer restart from
+		// the transport layer, leaving the cached ClientConn healthy-looking
+		// but silently cancelling RPCs.
+		InvalidateGrpcConnection(address)
+	}
+	return executionErr
 }
 
 func hostAndPort(address string) (host string, port uint64, err error) {
@@ -387,11 +553,4 @@ func WithOneOfGrpcFilerClients(streamingMode bool, filerAddresses []ServerAddres
 	}
 
 	return err
-}
-
-func WithWorkerClient(streamingMode bool, workerAddress string, grpcDialOption grpc.DialOption, fn func(client worker_pb.WorkerServiceClient) error) error {
-	return WithGrpcClient(streamingMode, 0, func(grpcConnection *grpc.ClientConn) error {
-		client := worker_pb.NewWorkerServiceClient(grpcConnection)
-		return fn(client)
-	}, workerAddress, false, grpcDialOption)
 }

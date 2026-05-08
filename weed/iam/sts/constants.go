@@ -46,6 +46,10 @@ const (
 	ConfigFieldBasePath              = "basePath"
 	ConfigFieldIssuer                = "issuer"
 	ConfigFieldClientID              = "clientId"
+	ConfigFieldClientIDs             = "clientIds"
+	ConfigFieldThumbprints           = "thumbprints"
+	ConfigFieldAllowedPrincipalTagKeys = "allowedPrincipalTagKeys"
+	ConfigFieldPolicyClaim             = "policyClaim"
 	ConfigFieldClientSecret          = "clientSecret"
 	ConfigFieldJWKSUri               = "jwksUri"
 	ConfigFieldScopes                = "scopes"
@@ -124,6 +128,7 @@ const (
 	ActionAssumeRole                = "sts:AssumeRole"
 	ActionAssumeRoleWithWebIdentity = "sts:AssumeRoleWithWebIdentity"
 	ActionAssumeRoleWithCredentials = "sts:AssumeRoleWithCredentials"
+	ActionGetFederationToken        = "sts:GetFederationToken"
 	ActionValidateSession           = "sts:ValidateSession"
 )
 

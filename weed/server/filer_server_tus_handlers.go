@@ -80,7 +80,10 @@ func (fs *FilerServer) tusOptionsHandler(w http.ResponseWriter, r *http.Request)
 
 // tusCreateHandler handles POST requests to create new uploads
 func (fs *FilerServer) tusCreateHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	// Use a context that ignores cancellation from the request context.
+	// Internal operations (creating TUS session, writing data, completing uploads)
+	// may exceed the filer's client connection inactivity timeout.
+	ctx := context.WithoutCancel(r.Context())
 
 	// Parse Upload-Length header (required)
 	uploadLengthStr := r.Header.Get("Upload-Length")
@@ -195,7 +198,11 @@ func (fs *FilerServer) tusHeadHandler(w http.ResponseWriter, r *http.Request, up
 
 // tusPatchHandler handles PATCH requests to upload data
 func (fs *FilerServer) tusPatchHandler(w http.ResponseWriter, r *http.Request, uploadID string) {
-	ctx := r.Context()
+	// Use a context that ignores cancellation from the request context.
+	// The filer's connection has an inactivity timeout: after the request body is fully read,
+	// internal operations (assigning file IDs, uploading to volume servers, completing uploads)
+	// may exceed the timeout, causing the request context to be canceled.
+	ctx := context.WithoutCancel(r.Context())
 
 	// Validate Content-Type
 	contentType := r.Header.Get("Content-Type")
@@ -314,6 +321,11 @@ func (fs *FilerServer) tusWriteData(ctx context.Context, session *TusSession, of
 		return 0, fmt.Errorf("detect storage option: %w", err)
 	}
 
+	// When DiskType is empty, use filer's -disk
+	if so.DiskType == "" {
+		so.DiskType = fs.option.DiskType
+	}
+
 	// Read first bytes for MIME type detection
 	sniffSize := int64(512)
 	if contentLength < sniffSize {
@@ -371,7 +383,7 @@ func (fs *FilerServer) tusWriteData(ctx context.Context, session *TusSession, of
 		chunkData := chunkBuf[:n]
 
 		// Assign file ID from master for this sub-chunk
-		fileId, urlLocation, auth, assignErr := fs.assignNewFileInfo(ctx, so)
+		fileId, urlLocation, auth, assignErr := fs.assignNewFileInfo(ctx, so, uint64(n))
 		if assignErr != nil {
 			uploadErr = fmt.Errorf("assign volume: %w", assignErr)
 			break

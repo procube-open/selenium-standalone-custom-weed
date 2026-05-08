@@ -1,8 +1,10 @@
 package mount
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"syscall"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"google.golang.org/protobuf/proto"
 )
 
 /**
@@ -62,9 +65,12 @@ func (wfs *WFS) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
 		return fuse.OK
 	}
 
-	// When a closing lock owner is present, flush synchronously before waking any
-	// blocked POSIX lock waiters so write-serialized callers cannot overtake each other.
-	allowAsync := in.LockOwner == 0
+	// FlushIn.LockOwner is populated by some FUSE kernels even when the process
+	// did not hold byte-range locks. Only force the synchronous close path when
+	// this owner actually has POSIX locks to release; otherwise writebackCache
+	// would silently degrade to a blocking flush for ordinary close().
+	hasPosixLocks := wfs.posixLocks.HasPosixOwner(in.NodeId, in.LockOwner)
+	allowAsync := !hasPosixLocks
 	status := wfs.doFlush(fh, in.Uid, in.Gid, allowAsync)
 	if in.LockOwner != 0 {
 		wfs.posixLocks.ReleasePosixOwner(in.NodeId, in.LockOwner)
@@ -143,6 +149,13 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.S
 		return fuse.OK
 	}
 
+	// Skip metadata flush if the file was unlinked while open.
+	// The filer entry is already gone; flushing would recreate it.
+	if fh.isDeleted {
+		glog.V(3).Infof("doFlush %s fh %d: file was unlinked, skipping metadata flush", fileFullPath, fh.fh)
+		return fuse.OK
+	}
+
 	if isOverQuota {
 		return fuse.Status(syscall.ENOSPC)
 	}
@@ -166,72 +179,162 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32, allowAsync bool) fuse.S
 
 // flushMetadataToFiler sends the file's chunk references and attributes to the filer.
 // This is shared between the synchronous doFlush path and the async flush completion.
+//
+// When -dlm is enabled, the distributed lock is already held by the FileHandle
+// from open-for-write through close, so no additional distributed lock is
+// needed here. The local fhLockTable lock below serializes within this mount.
 func (wfs *WFS) flushMetadataToFiler(fh *FileHandle, dir, name string, uid, gid uint32) error {
 	fileFullPath := fh.FullPath()
+	glog.V(4).Infof("flushMetadataToFiler %s/%s inode %d fh %d", dir, name, fh.inode, fh.fh)
 
 	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
-	err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+	entry := fh.GetEntry()
+	entry.Name = name // this flush may be just after a rename operation
 
-		entry := fh.GetEntry()
-		entry.Name = name // this flush may be just after a rename operation
-
-		if entry.Attributes != nil {
-			entry.Attributes.Mime = fh.contentType
-			if entry.Attributes.Uid == 0 {
-				entry.Attributes.Uid = uid
-			}
-			if entry.Attributes.Gid == 0 {
-				entry.Attributes.Gid = gid
-			}
-			entry.Attributes.Mtime = time.Now().Unix()
+	if entry.Attributes != nil {
+		entry.Attributes.Mime = fh.contentType
+		if entry.Attributes.Uid == 0 {
+			entry.Attributes.Uid = uid
 		}
-
-		request := &filer_pb.CreateEntryRequest{
-			Directory:                string(dir),
-			Entry:                    entry.GetEntry(),
-			Signatures:               []int32{wfs.signature},
-			SkipCheckParentDirectory: true,
+		if entry.Attributes.Gid == 0 {
+			entry.Attributes.Gid = gid
 		}
-		injectActorXAttrs(request.Entry)
+		flushNow := time.Now()
+		entry.Attributes.Mtime = flushNow.Unix()
+		entry.Attributes.MtimeNs = int32(flushNow.Nanosecond())
+		entry.Attributes.Ctime = flushNow.Unix()
+		entry.Attributes.CtimeNs = int32(flushNow.Nanosecond())
+	}
 
-		glog.V(4).Infof("%s set chunks: %v", fileFullPath, len(entry.GetChunks()))
+	glog.V(4).Infof("%s set chunks: %v", fileFullPath, len(entry.GetChunks()))
 
-		manifestChunks, nonManifestChunks := filer.SeparateManifestChunks(entry.GetChunks())
+	manifestChunks, nonManifestChunks := filer.SeparateManifestChunks(entry.GetChunks())
 
-		chunks, _ := filer.CompactFileChunks(context.Background(), wfs.LookupFn(), nonManifestChunks)
-		chunks, manifestErr := filer.MaybeManifestize(wfs.saveDataAsChunk(fileFullPath), chunks)
-		if manifestErr != nil {
-			// not good, but should be ok
-			glog.V(0).Infof("MaybeManifestize: %v", manifestErr)
-		}
-		entry.Chunks = append(chunks, manifestChunks...)
+	chunks, _ := filer.CompactFileChunks(context.Background(), wfs.LookupFn(), nonManifestChunks)
 
-		wfs.mapPbIdFromLocalToFiler(request.Entry)
-		defer wfs.mapPbIdFromFilerToLocal(request.Entry)
+	if mergedChunks, mergeErr := wfs.maybeMergeChunks(fileFullPath, chunks, manifestChunks); mergeErr != nil {
+		glog.V(0).Infof("maybeMergeChunks %s: %v", fileFullPath, mergeErr)
+	} else if mergedChunks != nil {
+		chunks = mergedChunks
+		manifestChunks = nil
+	}
 
-		resp, err := filer_pb.CreateEntryWithResponse(context.Background(), client, request)
-		if err != nil {
-			glog.Errorf("fh flush create %s: %v", fileFullPath, err)
-			return fmt.Errorf("fh flush create %s: %v", fileFullPath, err)
-		}
+	chunks, manifestErr := filer.MaybeManifestize(wfs.saveDataAsChunk(fileFullPath), chunks)
+	if manifestErr != nil {
+		// not good, but should be ok
+		glog.V(0).Infof("MaybeManifestize: %v", manifestErr)
+	}
+	entry.Chunks = append(chunks, manifestChunks...)
 
-		event := resp.GetMetadataEvent()
-		if event == nil {
-			event = metadataUpdateEvent(string(dir), request.Entry)
-		}
-		if applyErr := wfs.applyLocalMetadataEvent(context.Background(), event); applyErr != nil {
-			glog.Warningf("flush %s: best-effort metadata apply failed: %v", fileFullPath, applyErr)
-			wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(dir))
-		}
+	// Clone the proto entry for the filer request so that mapPbIdFromLocalToFiler
+	// does not mutate the file handle's live entry. Without the clone, a concurrent
+	// Lookup can observe filer-side uid/gid on the file handle entry and return it
+	// to the kernel, which caches it and then rejects opens by the local user.
+	requestEntry := proto.Clone(entry.GetEntry()).(*filer_pb.Entry)
+	request := &filer_pb.CreateEntryRequest{
+		Directory:                string(dir),
+		Entry:                    requestEntry,
+		Signatures:               []int32{wfs.signature},
+		SkipCheckParentDirectory: true,
+	}
+	injectActorXAttrs(request.Entry)
 
-		return nil
-	})
+	wfs.mapPbIdFromLocalToFiler(request.Entry)
+
+	resp, err := wfs.streamCreateEntry(context.Background(), request)
+	if err != nil {
+		glog.Errorf("fh flush create %s: %v", fileFullPath, err)
+		return fmt.Errorf("fh flush create %s: %v", fileFullPath, err)
+	}
+
+	event := resp.GetMetadataEvent()
+	if event == nil {
+		event = metadataUpdateEvent(string(dir), request.Entry)
+	}
+	if applyErr := wfs.applyLocalMetadataEvent(context.Background(), event); applyErr != nil {
+		glog.Warningf("flush %s: best-effort metadata apply failed: %v", fileFullPath, applyErr)
+		wfs.inodeToPath.InvalidateChildrenCache(util.FullPath(dir))
+	}
 
 	if err == nil {
 		fh.dirtyMetadata = false
 	}
 
 	return err
+}
+
+// shouldMergeChunks reports whether the non-manifest chunks are bloated
+// enough to justify re-reading and re-uploading the file. The condition
+// is: sum of compacted chunk sizes > 2 * logical file size.
+func shouldMergeChunks(compactedChunks []*filer_pb.FileChunk, manifestChunks []*filer_pb.FileChunk) (totalChunkSize, fileSize uint64, merge bool) {
+	for _, chunk := range compactedChunks {
+		totalChunkSize += chunk.Size
+	}
+	// Count manifest coverage toward stored total. Each manifest holds
+	// sub-chunks on volume servers that cover approximately Size bytes.
+	// Without this, overlapping manifests accumulate undetected because
+	// the merge condition only saw the (small) non-manifest chunk total.
+	for _, chunk := range manifestChunks {
+		totalChunkSize += chunk.Size
+	}
+	allChunks := make([]*filer_pb.FileChunk, 0, len(compactedChunks)+len(manifestChunks))
+	allChunks = append(allChunks, compactedChunks...)
+	allChunks = append(allChunks, manifestChunks...)
+	fileSize = filer.TotalSize(allChunks)
+	merge = fileSize > 0 && totalChunkSize > 2*fileSize
+	return
+}
+
+// maybeMergeChunks re-reads and re-uploads file data as properly sized chunks
+// when the total stored chunk data significantly exceeds the logical file size,
+// which happens after many random writes create partially-overlapping small chunks.
+func (wfs *WFS) maybeMergeChunks(fileFullPath util.FullPath, compactedChunks []*filer_pb.FileChunk, manifestChunks []*filer_pb.FileChunk) ([]*filer_pb.FileChunk, error) {
+	totalChunkSize, fileSize, merge := shouldMergeChunks(compactedChunks, manifestChunks)
+	if !merge {
+		return nil, nil
+	}
+
+	glog.V(0).Infof("%.1fx chunk bloat detected on %s (%d chunks, %d stored vs %d content), merging",
+		float64(totalChunkSize)/float64(fileSize), fileFullPath, len(compactedChunks), totalChunkSize, fileSize)
+
+	ctx := context.Background()
+	allChunks := make([]*filer_pb.FileChunk, 0, len(compactedChunks)+len(manifestChunks))
+	allChunks = append(allChunks, compactedChunks...)
+	allChunks = append(allChunks, manifestChunks...)
+	reader := filer.NewChunkStreamReaderFromLookup(ctx, wfs.LookupFn(), allChunks)
+	defer reader.Close()
+
+	saveFunc := wfs.saveDataAsChunk(fileFullPath)
+	chunkSize := wfs.option.ChunkSizeLimit
+	if int64(fileSize) < chunkSize {
+		chunkSize = int64(fileSize)
+	}
+
+	var newChunks []*filer_pb.FileChunk
+	var offset int64
+	buf := make([]byte, chunkSize)
+
+	for {
+		n, readErr := io.ReadFull(reader, buf)
+		if n > 0 {
+			chunk, uploadErr := saveFunc(bytes.NewReader(buf[:n]), "", offset, 0, uint64(n))
+			if uploadErr != nil {
+				return nil, uploadErr
+			}
+			newChunks = append(newChunks, chunk)
+			offset += int64(n)
+		}
+		if readErr != nil {
+			if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+				break
+			}
+			return nil, readErr
+		}
+	}
+
+	glog.V(0).Infof("merged %s: %d chunks -> %d chunks", fileFullPath, len(compactedChunks)+len(manifestChunks), len(newChunks))
+
+	return newChunks, nil
 }

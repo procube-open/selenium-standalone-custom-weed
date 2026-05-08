@@ -1,7 +1,6 @@
 package shell
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -16,11 +15,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle_map"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
-	"github.com/seaweedfs/seaweedfs/weed/util"
 
-	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
-	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 )
 
@@ -316,8 +312,10 @@ func (c *commandVolumeFixReplication) deleteOneVolume(commandEnv *CommandEnv, wr
 			}
 		}
 
+		// Surplus replica being trimmed; keep the remote object since other
+		// replicas of the same .vif still reference it.
 		if err := deleteVolume(commandEnv.option.GrpcDialOption, needle.VolumeId(replica.info.Id),
-			pb.NewServerAddressFromDataNode(replica.location.dataNode), false); err != nil {
+			pb.NewServerAddressFromDataNode(replica.location.dataNode), false, true); err != nil {
 			fmt.Fprintf(writer, "deleting volume %d from %s : %v", replica.info.Id, replica.location.dataNode.Id, err)
 		}
 
@@ -337,8 +335,9 @@ func (c *commandVolumeFixReplication) fixUnderReplicatedVolumes(commandEnv *Comm
 	}
 	for _, vid := range volumeIds {
 		for i := 0; i < retryCount+1; i++ {
-			if err = c.fixOneUnderReplicatedVolume(commandEnv, writer, applyChanges, volumeReplicas, vid, allLocations); err == nil {
-				if applyChanges {
+			var copied bool
+			if copied, err = c.fixOneUnderReplicatedVolume(commandEnv, writer, applyChanges, volumeReplicas, vid, allLocations); err == nil {
+				if applyChanges && copied {
 					fixedVolumes[strconv.FormatUint(uint64(vid), 10)] = len(volumeReplicas[vid])
 				}
 				break
@@ -350,7 +349,7 @@ func (c *commandVolumeFixReplication) fixUnderReplicatedVolumes(commandEnv *Comm
 	return fixedVolumes, nil
 }
 
-func (c *commandVolumeFixReplication) fixOneUnderReplicatedVolume(commandEnv *CommandEnv, writer io.Writer, applyChanges bool, volumeReplicas map[uint32][]*VolumeReplica, vid uint32, allLocations []location) error {
+func (c *commandVolumeFixReplication) fixOneUnderReplicatedVolume(commandEnv *CommandEnv, writer io.Writer, applyChanges bool, volumeReplicas map[uint32][]*VolumeReplica, vid uint32, allLocations []location) (bool, error) {
 	replicas := volumeReplicas[vid]
 	replica := pickOneReplicaToCopyFrom(replicas)
 	replicaPlacement, _ := super_block.NewReplicaPlacementFromByte(byte(replica.info.ReplicaPlacement))
@@ -370,7 +369,7 @@ func (c *commandVolumeFixReplication) fixOneUnderReplicatedVolume(commandEnv *Co
 					var err error
 					matched, err = filepath.Match(*c.collectionPattern, replica.info.Collection)
 					if err != nil {
-						return fmt.Errorf("match pattern %s with collection %s: %v", *c.collectionPattern, replica.info.Collection, err)
+						return false, fmt.Errorf("match pattern %s with collection %s: %v", *c.collectionPattern, replica.info.Collection, err)
 					}
 				}
 				if !matched {
@@ -386,48 +385,28 @@ func (c *commandVolumeFixReplication) fixOneUnderReplicatedVolume(commandEnv *Co
 			if !applyChanges {
 				// adjust volume count
 				addVolumeCount(dst.dataNode.DiskInfos[replica.info.DiskType], 1)
-				break
+				return true, nil
 			}
 
-			err := operation.WithVolumeServerClient(false, pb.NewServerAddressFromDataNode(dst.dataNode), commandEnv.option.GrpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-				stream, replicateErr := volumeServerClient.VolumeCopy(context.Background(), &volume_server_pb.VolumeCopyRequest{
-					VolumeId:       replica.info.Id,
-					SourceDataNode: string(pb.NewServerAddressFromDataNode(replica.location.dataNode)),
-				})
-				if replicateErr != nil {
-					return fmt.Errorf("copying from %s => %s : %v", replica.location.dataNode.Id, dst.dataNode.Id, replicateErr)
-				}
-				for {
-					resp, recvErr := stream.Recv()
-					if recvErr != nil {
-						if recvErr == io.EOF {
-							break
-						} else {
-							return recvErr
-						}
-					}
-					if resp.ProcessedBytes > 0 {
-						fmt.Fprintf(writer, "volume %d processed %s bytes\n", replica.info.Id, util.BytesToHumanReadable(uint64(resp.ProcessedBytes)))
-					}
-				}
-
-				return nil
-			})
+			err := replicateVolumeToServer(commandEnv.option.GrpcDialOption, writer, needle.VolumeId(replica.info.Id),
+				pb.NewServerAddressFromDataNode(replica.location.dataNode),
+				pb.NewServerAddressFromDataNode(dst.dataNode),
+				replica.info.DiskType)
 
 			if err != nil {
-				return err
+				return false, err
 			}
 
 			// adjust volume count
 			addVolumeCount(dst.dataNode.DiskInfos[replica.info.DiskType], 1)
-			break
+			return true, nil
 		}
 	}
 
 	if !foundNewLocation && !hasSkippedCollection {
 		fmt.Fprintf(writer, "failed to place volume %d replica as %s, existing:%+v\n", replica.info.Id, replicaPlacement, len(replicas))
 	}
-	return nil
+	return false, nil
 }
 
 func addVolumeCount(info *master_pb.DiskInfo, count int) {

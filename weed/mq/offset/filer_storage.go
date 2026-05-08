@@ -38,7 +38,7 @@ func (f *FilerOffsetStorage) SaveCheckpoint(namespace, topicName string, partiti
 	util.Uint64toBytes(offsetBytes, uint64(offset))
 
 	return f.filerClientAccessor.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		return filer.SaveInsideFiler(client, partitionDir, fileName, offsetBytes)
+		return filer.SaveInsideFiler(context.Background(), client, partitionDir, fileName, offsetBytes)
 	})
 }
 
@@ -92,10 +92,4 @@ func (f *FilerOffsetStorage) getPartitionDir(namespace, topicName string, partit
 	partitionRange := fmt.Sprintf("%04d-%04d", partition.RangeStart, partition.RangeStop)
 
 	return fmt.Sprintf("%s/%s/%s/%s/%s", filer.TopicsDir, namespace, topicName, version, partitionRange)
-}
-
-// getPartitionKey generates a unique key for a partition
-func (f *FilerOffsetStorage) getPartitionKey(partition *schema_pb.Partition) string {
-	return fmt.Sprintf("ring:%d:range:%d-%d:time:%d",
-		partition.RingSize, partition.RangeStart, partition.RangeStop, partition.UnixTimeNs)
 }

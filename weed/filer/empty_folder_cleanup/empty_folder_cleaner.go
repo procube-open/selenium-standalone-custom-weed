@@ -18,8 +18,8 @@ const (
 	DefaultMaxCountCheck  = 1000
 	DefaultCacheExpiry    = 5 * time.Minute
 	DefaultQueueMaxSize   = 1000
-	DefaultQueueMaxAge    = 5 * time.Second
-	DefaultProcessorSleep = 10 * time.Second // How often to check queue
+	DefaultQueueMaxAge    = 2 * time.Minute
+	DefaultProcessorSleep = 30 * time.Second // How often to check queue
 )
 
 // FilerOperations defines the filer operations needed by EmptyFolderCleaner
@@ -27,6 +27,7 @@ type FilerOperations interface {
 	CountDirectoryEntries(ctx context.Context, dirPath util.FullPath, limit int) (count int, err error)
 	DeleteEntryMetaAndData(ctx context.Context, p util.FullPath, isRecursive, ignoreRecursiveError, shouldDeleteChunks, isFromOtherCluster bool, signatures []int32, ifNotModifiedAfter int64) error
 	GetEntryAttributes(ctx context.Context, p util.FullPath) (attributes map[string][]byte, err error)
+	IsDirectoryKeyObject(ctx context.Context, p util.FullPath) (bool, error)
 }
 
 // folderState tracks the state of a folder for empty folder cleanup
@@ -69,15 +70,20 @@ type EmptyFolderCleaner struct {
 	stopCh  chan struct{}
 }
 
-// NewEmptyFolderCleaner creates a new EmptyFolderCleaner
-func NewEmptyFolderCleaner(filer FilerOperations, lockRing *lock_manager.LockRing, host pb.ServerAddress, bucketPath string) *EmptyFolderCleaner {
+// NewEmptyFolderCleaner creates a new EmptyFolderCleaner.
+// cleanupDelay controls how long an empty folder must remain in the queue before deletion.
+// If zero, DefaultQueueMaxAge is used.
+func NewEmptyFolderCleaner(filer FilerOperations, lockRing *lock_manager.LockRing, host pb.ServerAddress, bucketPath string, cleanupDelay time.Duration) *EmptyFolderCleaner {
+	if cleanupDelay <= 0 {
+		cleanupDelay = DefaultQueueMaxAge
+	}
 	efc := &EmptyFolderCleaner{
 		filer:                 filer,
 		lockRing:              lockRing,
 		host:                  host,
 		folderCounts:          make(map[string]*folderState),
 		bucketCleanupPolicies: make(map[string]*bucketCleanupPolicyState),
-		cleanupQueue:          NewCleanupQueue(DefaultQueueMaxSize, DefaultQueueMaxAge),
+		cleanupQueue:          NewCleanupQueue(DefaultQueueMaxSize, cleanupDelay),
 		maxCountCheck:         DefaultMaxCountCheck,
 		cacheExpiry:           DefaultCacheExpiry,
 		processorSleep:        DefaultProcessorSleep,
@@ -106,24 +112,11 @@ func (efc *EmptyFolderCleaner) IsEnabled() bool {
 
 // ownsFolder checks if this filer owns the folder via consistent hashing
 func (efc *EmptyFolderCleaner) ownsFolder(folder string) bool {
-	servers := efc.lockRing.GetSnapshot()
-	if len(servers) <= 1 {
-		return true // Single filer case
+	primary := efc.lockRing.GetPrimary(folder)
+	if primary == "" {
+		return true // Single filer case or no servers
 	}
-	return efc.hashKeyToServer(folder, servers) == efc.host
-}
-
-// hashKeyToServer uses consistent hashing to map a folder to a server
-func (efc *EmptyFolderCleaner) hashKeyToServer(key string, servers []pb.ServerAddress) pb.ServerAddress {
-	if len(servers) == 0 {
-		return ""
-	}
-	x := util.HashStringToLong(key)
-	if x < 0 {
-		x = -x
-	}
-	x = x % int64(len(servers))
-	return servers[x]
+	return primary == efc.host
 }
 
 // OnDeleteEvent is called when a file or directory is deleted
@@ -219,27 +212,22 @@ func (efc *EmptyFolderCleaner) cleanupProcessor() {
 
 // processCleanupQueue processes items from the cleanup queue
 func (efc *EmptyFolderCleaner) processCleanupQueue() {
-	// Check if we should process
-	if !efc.cleanupQueue.ShouldProcess() {
-		if efc.cleanupQueue.Len() > 0 {
-			glog.Infof("EmptyFolderCleaner: pending queue not processed yet (len=%d, oldest_age=%v, max_size=%d, max_age=%v)",
-				efc.cleanupQueue.Len(), efc.cleanupQueue.OldestAge(), efc.cleanupQueue.maxSize, efc.cleanupQueue.maxAge)
-		}
+	if efc.cleanupQueue.Len() == 0 {
 		return
 	}
 
-	glog.V(3).Infof("EmptyFolderCleaner: processing cleanup queue (len=%d, age=%v)",
+	glog.V(3).Infof("EmptyFolderCleaner: processing cleanup queue (len=%d, oldest_age=%v)",
 		efc.cleanupQueue.Len(), efc.cleanupQueue.OldestAge())
 
-	// Process all items that are ready
-	for efc.cleanupQueue.Len() > 0 {
+	// Only process items that have been queued longer than maxAge
+	for {
 		// Check if still enabled
 		if !efc.IsEnabled() {
 			return
 		}
 
-		// Pop the oldest item
-		folder, triggeredBy, ok := efc.cleanupQueue.Pop()
+		// Only pop items old enough — newer items stay in the queue
+		folder, triggeredBy, ok := efc.cleanupQueue.PopOlderThan(efc.cleanupQueue.maxAge)
 		if !ok {
 			break
 		}
@@ -308,7 +296,17 @@ func (efc *EmptyFolderCleaner) executeCleanup(folder string, triggeredBy string)
 	efc.mu.Unlock()
 
 	if count > 0 {
-		glog.Infof("EmptyFolderCleaner: folder %s (triggered by %s) has %d items, not empty", folder, triggeredBy, count)
+		glog.V(4).Infof("EmptyFolderCleaner: folder %s (triggered by %s) has %d items, not empty", folder, triggeredBy, count)
+		return
+	}
+
+	// Skip explicitly created directory markers (e.g., PUT /bucket/folder/)
+	// These have a MIME type set and should be preserved even when empty
+	if isKeyObj, err := efc.filer.IsDirectoryKeyObject(ctx, util.FullPath(folder)); err != nil {
+		glog.V(2).Infof("EmptyFolderCleaner: error checking directory key object %s: %v", folder, err)
+		return
+	} else if isKeyObj {
+		glog.V(3).Infof("EmptyFolderCleaner: skipping %s (triggered by %s), explicit directory marker", folder, triggeredBy)
 		return
 	}
 
@@ -324,9 +322,18 @@ func (efc *EmptyFolderCleaner) executeCleanup(folder string, triggeredBy string)
 	delete(efc.folderCounts, folder)
 	efc.mu.Unlock()
 
-	// Note: No need to recursively check parent folder here.
-	// The deletion of this folder will generate a metadata event,
-	// which will trigger OnDeleteEvent for the parent folder.
+	// After deleting this folder, immediately try to clean the parent.
+	// Relying solely on cascading metadata events would re-enter the full
+	// delay queue for each ancestor level, causing multi-minute cascading
+	// waits (e.g. 3 levels × 2m = 6m+).  Instead, walk up eagerly.
+	parentDir, _ := util.FullPath(folder).DirAndName()
+	if parentDir != "" && parentDir != folder &&
+		efc.bucketPath != "" && isUnderBucketPath(parentDir, efc.bucketPath) {
+		// Remove any pending queue entry for the parent so we don't
+		// double-process it later from a stale event.
+		efc.cleanupQueue.Remove(parentDir)
+		efc.executeCleanup(parentDir, triggeredBy)
+	}
 }
 
 // countItems counts items in a folder (up to maxCountCheck)

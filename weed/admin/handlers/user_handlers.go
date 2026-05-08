@@ -93,6 +93,11 @@ func (h *UserHandlers) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.adminServer.IsStaticUser(username) {
+		writeJSONError(w, http.StatusForbidden, "Cannot modify static user "+username+" (loaded from config file)")
+		return
+	}
+
 	var req dash.UpdateUserRequest
 	if err := decodeJSONBody(newJSONMaxReader(w, r), &req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "Invalid request: "+err.Error())
@@ -117,6 +122,11 @@ func (h *UserHandlers) DeleteUser(w http.ResponseWriter, r *http.Request) {
 	username := mux.Vars(r)["username"]
 	if username == "" {
 		writeJSONError(w, http.StatusBadRequest, "Username is required")
+		return
+	}
+
+	if h.adminServer.IsStaticUser(username) {
+		writeJSONError(w, http.StatusForbidden, "Cannot delete static user "+username+" (loaded from config file)")
 		return
 	}
 
@@ -311,10 +321,19 @@ func (h *UserHandlers) getObjectStoreUsersData(r *http.Request) dash.ObjectStore
 		}
 	}
 
+	hasAnonymous := false
+	for _, u := range users {
+		if u.Username == "anonymous" {
+			hasAnonymous = true
+			break
+		}
+	}
+
 	return dash.ObjectStoreUsersData{
-		Username:    username,
-		Users:       users,
-		TotalUsers:  len(users),
-		LastUpdated: time.Now(),
+		Username:         username,
+		Users:            users,
+		TotalUsers:       len(users),
+		HasAnonymousUser: hasAnonymous,
+		LastUpdated:      time.Now(),
 	}
 }

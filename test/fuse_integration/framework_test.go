@@ -15,25 +15,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// FuseTestFramework provides utilities for FUSE integration testing
+// FuseTestFramework provides utilities for FUSE integration testing.
+// It starts a single "weed mini" process (master+volume+filer in one)
+// and a separate "weed mount" process for the FUSE filesystem.
 type FuseTestFramework struct {
-	t             *testing.T
-	tempDir       string
-	mountPoint    string
-	dataDir       string
-	logDir        string
-	masterProcess *os.Process
-	volumeProcess *os.Process
-	filerProcess  *os.Process
-	mountProcess  *os.Process
-	masterAddr    string
-	volumeAddr    string
-	filerAddr     string
-	masterPort    int
-	volumePort    int
-	filerPort     int
-	weedBinary    string
-	isSetup       bool
+	t            *testing.T
+	tempDir      string
+	mountPoint   string
+	dataDir      string
+	logDir       string
+	miniProcess  *os.Process
+	mountProcess *os.Process
+	filerAddr    string
+	filerPort    int
+	weedBinary   string
+	isSetup      bool
 }
 
 // TestConfig holds configuration for FUSE tests
@@ -63,8 +59,6 @@ func DefaultTestConfig() *TestConfig {
 }
 
 // NewFuseTestFramework creates a new FUSE testing framework.
-// Each instance allocates its own free ports so multiple tests can run
-// sequentially without port conflicts from slow cleanup.
 func NewFuseTestFramework(t *testing.T, config *TestConfig) *FuseTestFramework {
 	if config == nil {
 		config = DefaultTestConfig()
@@ -73,8 +67,6 @@ func NewFuseTestFramework(t *testing.T, config *TestConfig) *FuseTestFramework {
 	tempDir, err := os.MkdirTemp("", "seaweedfs_fuse_test_")
 	require.NoError(t, err)
 
-	masterPort := freePort(t)
-	volumePort := freePort(t)
 	filerPort := freePort(t)
 
 	return &FuseTestFramework{
@@ -83,23 +75,23 @@ func NewFuseTestFramework(t *testing.T, config *TestConfig) *FuseTestFramework {
 		mountPoint: filepath.Join(tempDir, "mount"),
 		dataDir:    filepath.Join(tempDir, "data"),
 		logDir:     filepath.Join(tempDir, "logs"),
-		masterPort: masterPort,
-		volumePort: volumePort,
 		filerPort:  filerPort,
-		masterAddr: fmt.Sprintf("127.0.0.1:%d", masterPort),
-		volumeAddr: fmt.Sprintf("127.0.0.1:%d", volumePort),
 		filerAddr:  fmt.Sprintf("127.0.0.1:%d", filerPort),
 		weedBinary: findWeedBinary(),
 		isSetup:    false,
 	}
 }
 
-// freePort asks the OS for a free TCP port.
+// freePort asks the OS for a free TCP port in a range where the gRPC
+// offset (port + 10000) won't collide with well-known ports.
+// Stay below the Linux ephemeral floor (32768) so the kernel does not
+// reuse the chosen port for an outbound connection between close() here
+// and re-bind in the child "weed mini" process.
 func freePort(t *testing.T) int {
 	t.Helper()
 	const (
 		minServicePort = 20000
-		maxServicePort = 55535 // SeaweedFS gRPC service uses httpPort + 10000.
+		maxServicePort = 32000
 	)
 
 	portCount := maxServicePort - minServicePort + 1
@@ -119,56 +111,28 @@ func freePort(t *testing.T) int {
 	return 0
 }
 
-// Setup starts SeaweedFS cluster and mounts FUSE filesystem
+// Setup starts "weed mini" and mounts the FUSE filesystem.
 func (f *FuseTestFramework) Setup(config *TestConfig) error {
 	if f.isSetup {
 		return fmt.Errorf("framework already setup")
 	}
 
-	// Create all required directories upfront
-	dirs := []string{
-		f.mountPoint,
-		f.logDir,
-		filepath.Join(f.dataDir, "master"),
-		filepath.Join(f.dataDir, "volume"),
-	}
+	dirs := []string{f.mountPoint, f.logDir, f.dataDir}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %v", dir, err)
 		}
 	}
 
-	// Start master
-	if err := f.startMaster(config); err != nil {
-		return fmt.Errorf("failed to start master: %v", err)
+	// Start weed mini (master + volume + filer in one process)
+	if err := f.startMini(config); err != nil {
+		return fmt.Errorf("failed to start weed mini: %v", err)
 	}
 
-	// Wait for master to be ready
-	if err := f.waitForService(f.masterAddr, 30*time.Second); err != nil {
-		f.dumpLog("master")
-		return fmt.Errorf("master not ready: %v", err)
-	}
-
-	// Start volume servers
-	if err := f.startVolumeServers(config); err != nil {
-		return fmt.Errorf("failed to start volume servers: %v", err)
-	}
-
-	// Wait for volume server to be ready
-	if err := f.waitForService(f.volumeAddr, 30*time.Second); err != nil {
-		f.dumpLog("volume")
-		return fmt.Errorf("volume server not ready: %v", err)
-	}
-
-	// Start filer
-	if err := f.startFiler(config); err != nil {
-		return fmt.Errorf("failed to start filer: %v", err)
-	}
-
-	// Wait for filer to be ready
+	// Wait for filer to be ready (mini starts all services on filerPort)
 	if err := f.waitForService(f.filerAddr, 30*time.Second); err != nil {
-		f.dumpLog("filer")
-		return fmt.Errorf("filer not ready: %v", err)
+		f.dumpLog("mini")
+		return fmt.Errorf("weed mini not ready: %v", err)
 	}
 
 	// Mount FUSE filesystem
@@ -186,24 +150,36 @@ func (f *FuseTestFramework) Setup(config *TestConfig) error {
 	return nil
 }
 
-// Cleanup stops all processes and removes temporary files
+// Cleanup stops all processes and removes temporary files.
+// If the test failed, it dumps logs automatically.
 func (f *FuseTestFramework) Cleanup() {
+	if f.t.Failed() {
+		f.DumpLogs()
+	}
+
 	if f.mountProcess != nil {
 		f.unmountFuse()
 	}
 
 	// Stop processes in reverse order
-	processes := []*os.Process{f.mountProcess, f.filerProcess, f.volumeProcess, f.masterProcess}
-	for _, proc := range processes {
+	for _, proc := range []*os.Process{f.mountProcess, f.miniProcess} {
 		if proc != nil {
 			proc.Signal(syscall.SIGTERM)
 			proc.Wait()
 		}
 	}
 
-	// Remove temp directory
+	f.copyLogsForCI()
+
 	if !DefaultTestConfig().SkipCleanup {
 		os.RemoveAll(f.tempDir)
+	}
+}
+
+// DumpLogs prints the tail of all SeaweedFS process logs to test output.
+func (f *FuseTestFramework) DumpLogs() {
+	for _, name := range []string{"mini", "mount"} {
+		f.dumpLog(name)
 	}
 }
 
@@ -238,82 +214,57 @@ func (f *FuseTestFramework) startProcess(name string, args []string) (*os.Proces
 }
 
 // dumpLog prints the last lines of a process log file to the test output
-// for debugging when a service fails to start.
+// for debugging when a service fails to start or a test fails.
 func (f *FuseTestFramework) dumpLog(name string) {
 	data, err := os.ReadFile(filepath.Join(f.logDir, name+".log"))
 	if err != nil {
 		f.t.Logf("[%s log] (not available: %v)", name, err)
 		return
 	}
-	// Truncate to last 2KB to keep output manageable
-	if len(data) > 2048 {
-		data = data[len(data)-2048:]
+	// Show last 16KB on failure for meaningful context.
+	const maxTail = 16 * 1024
+	if len(data) > maxTail {
+		data = data[len(data)-maxTail:]
 	}
-	f.t.Logf("[%s log tail]\n%s", name, string(data))
+	f.t.Logf("[%s log tail (%d bytes)]\n%s", name, len(data), string(data))
 }
 
-// startMaster starts the SeaweedFS master server
-func (f *FuseTestFramework) startMaster(config *TestConfig) error {
-	// Do NOT set -port.grpc explicitly. SeaweedFS convention is gRPC = HTTP + 10000.
-	// Volume/filer discover the master gRPC port by this convention, so overriding
-	// it breaks inter-service communication.
+// copyLogsForCI copies SeaweedFS process logs to /tmp/seaweedfs-fuse-logs/
+// so the CI workflow can upload them as artifacts.
+func (f *FuseTestFramework) copyLogsForCI() {
+	ciLogDir := "/tmp/seaweedfs-fuse-logs"
+	os.MkdirAll(ciLogDir, 0755)
+	for _, name := range []string{"mini", "mount"} {
+		src := filepath.Join(f.logDir, name+".log")
+		data, err := os.ReadFile(src)
+		if err != nil {
+			continue
+		}
+		os.WriteFile(filepath.Join(ciLogDir, name+".log"), data, 0644)
+	}
+}
+
+// startMini starts "weed mini" which runs master+volume+filer in one process.
+func (f *FuseTestFramework) startMini(config *TestConfig) error {
 	args := []string{
-		"master",
+		"mini",
+		"-dir=" + f.dataDir,
 		"-ip=127.0.0.1",
-		"-port=" + strconv.Itoa(f.masterPort),
-		"-mdir=" + filepath.Join(f.dataDir, "master"),
+		"-ip.bind=127.0.0.1",
+		"-filer.port=" + strconv.Itoa(f.filerPort),
+		"-s3=false",
+		"-webdav=false",
+		"-admin.ui=false",
 	}
 	if config.EnableDebug {
 		args = append(args, "-v=4")
 	}
 
-	proc, err := f.startProcess("master", args)
+	proc, err := f.startProcess("mini", args)
 	if err != nil {
 		return err
 	}
-	f.masterProcess = proc
-	return nil
-}
-
-// startVolumeServers starts SeaweedFS volume servers
-func (f *FuseTestFramework) startVolumeServers(config *TestConfig) error {
-	args := []string{
-		"volume",
-		"-master=127.0.0.1:" + strconv.Itoa(f.masterPort),
-		"-ip=127.0.0.1",
-		"-port=" + strconv.Itoa(f.volumePort),
-		"-dir=" + filepath.Join(f.dataDir, "volume"),
-		fmt.Sprintf("-max=%d", config.NumVolumes),
-	}
-	if config.EnableDebug {
-		args = append(args, "-v=4")
-	}
-
-	proc, err := f.startProcess("volume", args)
-	if err != nil {
-		return err
-	}
-	f.volumeProcess = proc
-	return nil
-}
-
-// startFiler starts the SeaweedFS filer server
-func (f *FuseTestFramework) startFiler(config *TestConfig) error {
-	args := []string{
-		"filer",
-		"-master=127.0.0.1:" + strconv.Itoa(f.masterPort),
-		"-ip=127.0.0.1",
-		"-port=" + strconv.Itoa(f.filerPort),
-	}
-	if config.EnableDebug {
-		args = append(args, "-v=4")
-	}
-
-	proc, err := f.startProcess("filer", args)
-	if err != nil {
-		return err
-	}
-	f.filerProcess = proc
+	f.miniProcess = proc
 	return nil
 }
 
@@ -386,9 +337,7 @@ func (f *FuseTestFramework) waitForService(addr string, timeout time.Duration) e
 func (f *FuseTestFramework) waitForMount(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		// Check if mount point is accessible
 		if _, err := os.Stat(f.mountPoint); err == nil {
-			// Try to list directory
 			if _, err := os.ReadDir(f.mountPoint); err == nil {
 				return nil
 			}
@@ -399,19 +348,13 @@ func (f *FuseTestFramework) waitForMount(timeout time.Duration) error {
 }
 
 // findWeedBinary locates the weed binary.
-// Checks PATH first (most reliable in CI where the binary is installed to
-// /usr/local/bin), then falls back to relative paths.  Each candidate is
-// verified to be a regular file so that a source directory named "weed"
-// is never mistaken for the binary.
 func findWeedBinary() string {
-	// PATH lookup first — works in CI and when weed is installed globally.
 	if p, err := exec.LookPath("weed"); err == nil {
 		return p
 	}
 
-	// Relative paths for local development (run from test/fuse_integration/).
 	candidates := []string{
-		"../../weed/weed", // built in-tree: weed/weed
+		"../../weed/weed",
 		"./weed",
 		"../weed",
 	}
@@ -422,17 +365,82 @@ func findWeedBinary() string {
 		}
 	}
 
-	// Default fallback — will fail with a clear "not found" at exec time.
 	return "weed"
 }
 
 // Helper functions for test assertions
 
-// AssertFileExists checks if a file exists in the mount point
+// AssertFileExists checks if a file exists in the mount point. On failure,
+// it gathers diagnostic state (retry stat, parent listing, direct open) so
+// transient FUSE flakes leave enough information to identify the layer that
+// dropped the entry. The diagnostic block runs only on the failure path.
 func (f *FuseTestFramework) AssertFileExists(relativePath string) {
 	fullPath := filepath.Join(f.mountPoint, relativePath)
 	_, err := os.Stat(fullPath)
-	require.NoError(f.t, err, "file should exist: %s", relativePath)
+	if err == nil {
+		return
+	}
+	f.dumpExistenceDiagnostics(relativePath, fullPath, err)
+	require.NoError(f.t, err, "file should exist: %s (see diagnostic logs above)", relativePath)
+}
+
+// dumpExistenceDiagnostics is invoked when AssertFileExists fails. It probes
+// whether the missing entry is transient (retries appear), missing from the
+// parent directory listing, or missing via a direct open syscall — three
+// signals that triangulate where the entry was lost (kernel dentry cache vs
+// mount lookup vs filer).
+func (f *FuseTestFramework) dumpExistenceDiagnostics(relativePath, fullPath string, initialErr error) {
+	f.t.Logf("AssertFileExists diagnostic dump for %s", relativePath)
+	f.t.Logf("  initial stat: err=%v isNotExist=%v", initialErr, os.IsNotExist(initialErr))
+
+	// Retry stat to detect transient invisibility — if it becomes visible
+	// the issue is a short-lived dentry/cache window; if it stays missing
+	// the entry is genuinely gone from the filer or the local cache.
+	for attempt := 1; attempt <= 5; attempt++ {
+		time.Sleep(100 * time.Millisecond)
+		_, err := os.Stat(fullPath)
+		f.t.Logf("  retry #%d after %dms: err=%v", attempt, attempt*100, err)
+		if err == nil {
+			break
+		}
+	}
+
+	// List the parent directory: if the file appears here but stat fails,
+	// the failure is in the kernel's per-name dentry cache; if not, the
+	// mount-side LOOKUP itself is dropping the entry.
+	parentDir := filepath.Dir(fullPath)
+	target := filepath.Base(fullPath)
+	if entries, listErr := os.ReadDir(parentDir); listErr != nil {
+		f.t.Logf("  ReadDir(%s) failed: %v", parentDir, listErr)
+	} else {
+		found := false
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+			if e.Name() == target {
+				found = true
+			}
+		}
+		f.t.Logf("  ReadDir(%s): %d entries, target %q present=%v", parentDir, len(entries), target, found)
+		if len(names) <= 32 {
+			f.t.Logf("  ReadDir entries: %v", names)
+		}
+	}
+
+	// Direct O_RDONLY open — exercises the same FUSE Lookup+Open path
+	// userspace would, but separately from stat, in case stat-only caching
+	// is interfering.
+	if fd, openErr := os.OpenFile(fullPath, os.O_RDONLY, 0); openErr != nil {
+		f.t.Logf("  Open(%s, O_RDONLY): %v", fullPath, openErr)
+	} else {
+		st, statErr := fd.Stat()
+		fd.Close()
+		size := int64(-1)
+		if statErr == nil && st != nil {
+			size = st.Size()
+		}
+		f.t.Logf("  Open(%s, O_RDONLY): success size=%d statErr=%v", fullPath, size, statErr)
+	}
 }
 
 // AssertFileNotExists checks if a file does not exist in the mount point

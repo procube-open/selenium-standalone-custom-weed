@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,7 +15,9 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/worker_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
+	"github.com/seaweedfs/seaweedfs/weed/storage/idx"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	storagetypes "github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/storage/volume_info"
 	"github.com/seaweedfs/seaweedfs/weed/worker/types"
 	"github.com/seaweedfs/seaweedfs/weed/worker/types/base"
@@ -146,15 +147,21 @@ func (t *ErasureCodingTask) Execute(ctx context.Context, params *worker_pb.TaskP
 	// Step 1: Mark volume readonly
 	t.ReportProgressWithStage(10.0, "Marking volume readonly")
 	t.GetLogger().Info("Marking volume readonly")
-	if err := t.markVolumeReadonly(); err != nil {
+	if err := t.markVolumeReadonly(ctx); err != nil {
 		return fmt.Errorf("failed to mark volume readonly: %v", err)
 	}
 
 	// Step 2: Copy volume files to worker
+	// The .idx and .dat are copied as separate network transfers, with .idx
+	// copied first. If a write lands on the source after the .idx copy, the
+	// .dat will include extra data not referenced by .idx (harmless).
+	// verifyDatIdxConsistency() in generateEcShardsLocally catches the reverse
+	// case where .idx references data past .dat.
 	t.ReportProgressWithStage(25.0, "Copying volume files to worker")
 	t.GetLogger().Info("Copying volume files to worker")
-	localFiles, err := t.copyVolumeFilesToWorker(taskWorkDir)
+	localFiles, err := t.copyVolumeFilesToWorker(ctx, taskWorkDir)
 	if err != nil {
+		t.rollbackReadonly(ctx)
 		return fmt.Errorf("failed to copy volume files: %v", err)
 	}
 
@@ -163,6 +170,7 @@ func (t *ErasureCodingTask) Execute(ctx context.Context, params *worker_pb.TaskP
 	t.GetLogger().Info("Generating EC shards locally")
 	shardFiles, err := t.generateEcShardsLocally(localFiles, taskWorkDir)
 	if err != nil {
+		t.rollbackReadonly(ctx)
 		return fmt.Errorf("failed to generate EC shards: %v", err)
 	}
 
@@ -183,7 +191,7 @@ func (t *ErasureCodingTask) Execute(ctx context.Context, params *worker_pb.TaskP
 	// Step 6: Delete original volume
 	t.ReportProgressWithStage(90.0, "Deleting original volume")
 	t.GetLogger().Info("Deleting original volume")
-	if err := t.deleteOriginalVolume(); err != nil {
+	if err := t.deleteOriginalVolume(ctx); err != nil {
 		return fmt.Errorf("failed to delete original volume: %v", err)
 	}
 
@@ -250,51 +258,70 @@ func (t *ErasureCodingTask) GetProgress() float64 {
 // Helper methods for actual EC operations
 
 // markVolumeReadonly marks the volume as readonly on the source server
-func (t *ErasureCodingTask) markVolumeReadonly() error {
+func (t *ErasureCodingTask) markVolumeReadonly(ctx context.Context) error {
 	return operation.WithVolumeServerClient(false, pb.ServerAddress(t.server), t.grpcDialOption,
 		func(client volume_server_pb.VolumeServerClient) error {
-			_, err := client.VolumeMarkReadonly(context.Background(), &volume_server_pb.VolumeMarkReadonlyRequest{
+			_, err := client.VolumeMarkReadonly(ctx, &volume_server_pb.VolumeMarkReadonlyRequest{
 				VolumeId: t.volumeID,
 			})
 			return err
 		})
 }
 
-// copyVolumeFilesToWorker copies .dat and .idx files from source server to local worker
-func (t *ErasureCodingTask) copyVolumeFilesToWorker(workDir string) (map[string]string, error) {
+// rollbackReadonly is a best-effort rollback of markVolumeReadonly, used when the
+// EC task fails before any shards are distributed. Logs but does not return errors.
+// Uses a fresh context with timeout since the caller's ctx may already be cancelled.
+func (t *ErasureCodingTask) rollbackReadonly(_ context.Context) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := t.markVolumeWritable(ctx); err != nil {
+		glog.Warningf("failed to restore volume %d to writable after EC task failure: %v", t.volumeID, err)
+	} else {
+		glog.V(0).Infof("restored volume %d to writable after EC task failure", t.volumeID)
+	}
+}
+
+// markVolumeWritable restores the volume to writable on the source server.
+func (t *ErasureCodingTask) markVolumeWritable(ctx context.Context) error {
+	return operation.WithVolumeServerClient(false, pb.ServerAddress(t.server), t.grpcDialOption,
+		func(client volume_server_pb.VolumeServerClient) error {
+			_, err := client.VolumeMarkWritable(ctx, &volume_server_pb.VolumeMarkWritableRequest{
+				VolumeId: t.volumeID,
+			})
+			return err
+		})
+}
+
+// copyVolumeFilesToWorker copies .idx and .dat files from source server to local worker.
+// The .idx is copied first, then .dat. Both copies are capped to the sizes reported by
+// ReadVolumeFileStatus. If a write lands after .idx is copied, .dat may include extra
+// data not referenced by .idx (harmless). The reverse (idx referencing data past .dat)
+// is caught by verifyDatIdxConsistency in generateEcShardsLocally.
+func (t *ErasureCodingTask) copyVolumeFilesToWorker(ctx context.Context, workDir string) (map[string]string, error) {
 	localFiles := make(map[string]string)
 
+	fileStatus, err := t.readSourceVolumeFileStatus(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read source volume file status: %v", err)
+	}
+
 	t.GetLogger().WithFields(map[string]interface{}{
-		"volume_id":   t.volumeID,
-		"source":      t.server,
-		"working_dir": workDir,
+		"volume_id":           t.volumeID,
+		"source":              t.server,
+		"working_dir":         workDir,
+		"compaction_revision": fileStatus.GetCompactionRevision(),
+		"dat_file_size_bytes": fileStatus.GetDatFileSize(),
+		"idx_file_size_bytes": fileStatus.GetIdxFileSize(),
 	}).Info("Starting volume file copy from source server")
 
-	// Copy .dat file
-	datFile := filepath.Join(workDir, fmt.Sprintf("%d.dat", t.volumeID))
-	if err := t.copyFileFromSource(".dat", datFile); err != nil {
-		return nil, fmt.Errorf("failed to copy .dat file: %v", err)
-	}
-	localFiles["dat"] = datFile
-
-	// Log .dat file size
-	if info, err := os.Stat(datFile); err == nil {
-		t.GetLogger().WithFields(map[string]interface{}{
-			"file_type":  ".dat",
-			"file_path":  datFile,
-			"size_bytes": info.Size(),
-			"size_mb":    float64(info.Size()) / (1024 * 1024),
-		}).Info("Volume data file copied successfully")
-	}
-
-	// Copy .idx file
+	// Copy .idx file FIRST — if a write lands on the source after this copy,
+	// the .dat copy will include the new data but .idx won't reference it.
 	idxFile := filepath.Join(workDir, fmt.Sprintf("%d.idx", t.volumeID))
-	if err := t.copyFileFromSource(".idx", idxFile); err != nil {
+	if err := t.copyFileFromSource(ctx, ".idx", idxFile, fileStatus.GetCompactionRevision(), fileStatus.GetIdxFileSize()); err != nil {
 		return nil, fmt.Errorf("failed to copy .idx file: %v", err)
 	}
 	localFiles["idx"] = idxFile
 
-	// Log .idx file size
 	if info, err := os.Stat(idxFile); err == nil {
 		t.GetLogger().WithFields(map[string]interface{}{
 			"file_type":  ".idx",
@@ -304,18 +331,57 @@ func (t *ErasureCodingTask) copyVolumeFilesToWorker(workDir string) (map[string]
 		}).Info("Volume index file copied successfully")
 	}
 
+	// Copy .dat file SECOND — guaranteed to have at least as much data as .idx references.
+	datFile := filepath.Join(workDir, fmt.Sprintf("%d.dat", t.volumeID))
+	if err := t.copyFileFromSource(ctx, ".dat", datFile, fileStatus.GetCompactionRevision(), fileStatus.GetDatFileSize()); err != nil {
+		return nil, fmt.Errorf("failed to copy .dat file: %v", err)
+	}
+	localFiles["dat"] = datFile
+
+	if info, err := os.Stat(datFile); err == nil {
+		t.GetLogger().WithFields(map[string]interface{}{
+			"file_type":  ".dat",
+			"file_path":  datFile,
+			"size_bytes": info.Size(),
+			"size_mb":    float64(info.Size()) / (1024 * 1024),
+		}).Info("Volume data file copied successfully")
+	}
+
 	return localFiles, nil
 }
 
+func (t *ErasureCodingTask) readSourceVolumeFileStatus(ctx context.Context) (*volume_server_pb.ReadVolumeFileStatusResponse, error) {
+	var statusResp *volume_server_pb.ReadVolumeFileStatusResponse
+	err := operation.WithVolumeServerClient(false, pb.ServerAddress(t.server), t.grpcDialOption,
+		func(client volume_server_pb.VolumeServerClient) error {
+			var readErr error
+			statusResp, readErr = client.ReadVolumeFileStatus(ctx, &volume_server_pb.ReadVolumeFileStatusRequest{
+				VolumeId: t.volumeID,
+			})
+			return readErr
+		})
+	if err != nil {
+		return nil, err
+	}
+	if statusResp.GetDatFileSize() == 0 {
+		return nil, fmt.Errorf("volume %d on %s reports zero dat file size", t.volumeID, t.server)
+	}
+	if statusResp.GetIdxFileSize() == 0 {
+		return nil, fmt.Errorf("volume %d on %s reports zero idx file size with non-empty dat", t.volumeID, t.server)
+	}
+	return statusResp, nil
+}
+
 // copyFileFromSource copies a file from source server to local path using gRPC streaming
-func (t *ErasureCodingTask) copyFileFromSource(ext, localPath string) error {
+func (t *ErasureCodingTask) copyFileFromSource(ctx context.Context, ext, localPath string, compactionRevision uint32, stopOffset uint64) error {
 	return operation.WithVolumeServerClient(false, pb.ServerAddress(t.server), t.grpcDialOption,
 		func(client volume_server_pb.VolumeServerClient) error {
-			stream, err := client.CopyFile(context.Background(), &volume_server_pb.CopyFileRequest{
-				VolumeId:   t.volumeID,
-				Collection: t.collection,
-				Ext:        ext,
-				StopOffset: uint64(math.MaxInt64),
+			stream, err := client.CopyFile(ctx, &volume_server_pb.CopyFileRequest{
+				VolumeId:           t.volumeID,
+				Collection:         t.collection,
+				Ext:                ext,
+				CompactionRevision: compactionRevision,
+				StopOffset:         stopOffset,
 			})
 			if err != nil {
 				return fmt.Errorf("failed to initiate file copy: %v", err)
@@ -348,6 +414,9 @@ func (t *ErasureCodingTask) copyFileFromSource(ext, localPath string) error {
 				}
 			}
 
+			if totalBytes != int64(stopOffset) {
+				return fmt.Errorf("short copy of %s: got %d bytes, expected %d", ext, totalBytes, stopOffset)
+			}
 			glog.V(1).Infof("Successfully copied %s (%d bytes) from %s to %s", ext, totalBytes, t.server, localPath)
 			return nil
 		})
@@ -368,14 +437,21 @@ func (t *ErasureCodingTask) generateEcShardsLocally(localFiles map[string]string
 
 	glog.V(1).Infof("Generating EC shards from local files: dat=%s, idx=%s", datFile, idxFile)
 
+	// Verify .dat and .idx are consistent before EC encoding.
+	// Since they were copied as separate network transfers, the .idx may have
+	// entries pointing past the end of .dat if a write landed between the copies.
+	if err := verifyDatIdxConsistency(datFile, idxFile); err != nil {
+		return nil, fmt.Errorf("dat/idx consistency check failed: %v", err)
+	}
+
+	// Generate .ecx file from .idx BEFORE EC shards to prevent inconsistency.
+	if err := erasure_coding.WriteSortedFileFromIdx(baseName, ".ecx"); err != nil {
+		return nil, fmt.Errorf("failed to generate .ecx file: %v", err)
+	}
+
 	// Generate EC shard files (.ec00 ~ .ec13)
 	if err := erasure_coding.WriteEcFiles(baseName); err != nil {
 		return nil, fmt.Errorf("failed to generate EC shard files: %v", err)
-	}
-
-	// Generate .ecx file from .idx (use baseName, not full idx path)
-	if err := erasure_coding.WriteSortedFileFromIdx(baseName, ".ecx"); err != nil {
-		return nil, fmt.Errorf("failed to generate .ecx file: %v", err)
 	}
 
 	// Collect generated shard file paths and log details
@@ -468,7 +544,7 @@ func (t *ErasureCodingTask) mountEcShards() error {
 }
 
 // deleteOriginalVolume deletes the original volume and all its replicas from all servers
-func (t *ErasureCodingTask) deleteOriginalVolume() error {
+func (t *ErasureCodingTask) deleteOriginalVolume(ctx context.Context) error {
 	// Get replicas from task parameters (set during detection)
 	replicas := t.getReplicas()
 
@@ -497,7 +573,7 @@ func (t *ErasureCodingTask) deleteOriginalVolume() error {
 
 		err := operation.WithVolumeServerClient(false, pb.ServerAddress(replicaServer), t.grpcDialOption,
 			func(client volume_server_pb.VolumeServerClient) error {
-				_, err := client.VolumeDelete(context.Background(), &volume_server_pb.VolumeDeleteRequest{
+				_, err := client.VolumeDelete(ctx, &volume_server_pb.VolumeDeleteRequest{
 					VolumeId:  t.volumeID,
 					OnlyEmpty: false, // Force delete since we've created EC shards
 				})
@@ -520,7 +596,6 @@ func (t *ErasureCodingTask) deleteOriginalVolume() error {
 		}
 	}
 
-	// Report results
 	if len(deleteErrors) > 0 {
 		t.GetLogger().WithFields(map[string]interface{}{
 			"volume_id":      t.volumeID,
@@ -529,15 +604,18 @@ func (t *ErasureCodingTask) deleteOriginalVolume() error {
 			"total_replicas": len(replicas),
 			"success_rate":   float64(successCount) / float64(len(replicas)) * 100,
 			"errors":         deleteErrors,
-		}).Warning("Some volume deletions failed")
-		// Don't return error - EC task should still be considered successful if shards are mounted
-	} else {
-		t.GetLogger().WithFields(map[string]interface{}{
-			"volume_id":       t.volumeID,
-			"replica_count":   len(replicas),
-			"replica_servers": replicas,
-		}).Info("Successfully deleted volume from all replica servers")
+		}).Error("Failed to delete some original volume replicas after EC encoding")
+		// A surviving source replica lets a later detection scan re-propose
+		// EC on the same volume, which retries over mounted shards.
+		return fmt.Errorf("failed to delete %d of %d original volume replicas for volume %d: %s",
+			len(deleteErrors), len(replicas), t.volumeID, strings.Join(deleteErrors, "; "))
 	}
+
+	t.GetLogger().WithFields(map[string]interface{}{
+		"volume_id":       t.volumeID,
+		"replica_count":   len(replicas),
+		"replica_servers": replicas,
+	}).Info("Successfully deleted volume from all replica servers")
 
 	return nil
 }
@@ -554,4 +632,63 @@ func (t *ErasureCodingTask) getReplicas() []string {
 		}
 	}
 	return replicas
+}
+
+// verifyDatIdxConsistency checks that all .idx entries reference data within the
+// .dat file. Since .dat and .idx are copied as separate network transfers, the
+// .idx may have entries from writes that landed after the .dat was copied.
+func verifyDatIdxConsistency(datFile, idxFile string) error {
+	datInfo, err := os.Stat(datFile)
+	if err != nil {
+		return fmt.Errorf("stat dat file: %v", err)
+	}
+	datSize := datInfo.Size()
+
+	// Read volume version from superblock to compute actual needle sizes
+	df, err := os.Open(datFile)
+	if err != nil {
+		return fmt.Errorf("open dat file: %v", err)
+	}
+	defer df.Close()
+
+	versionBytes := make([]byte, 1)
+	if _, err := df.ReadAt(versionBytes, 0); err != nil {
+		return fmt.Errorf("read version byte: %v", err)
+	}
+	version := needle.Version(versionBytes[0])
+
+	idxF, err := os.Open(idxFile)
+	if err != nil {
+		return fmt.Errorf("open idx file: %v", err)
+	}
+	defer idxF.Close()
+
+	var maxEnd int64
+	var maxEndNeedleId storagetypes.NeedleId
+	var entryCount int64
+	err = idx.WalkIndexFile(idxF, 0, func(key storagetypes.NeedleId, offset storagetypes.Offset, size storagetypes.Size) error {
+		entryCount++
+		if size.IsDeleted() {
+			return nil
+		}
+		end := offset.ToActualOffset() + needle.GetActualSize(size, version)
+		if end > maxEnd {
+			maxEnd = end
+			maxEndNeedleId = key
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("walk idx file: %v", err)
+	}
+
+	if maxEnd > datSize {
+		return fmt.Errorf(
+			"idx references data beyond dat file: needle %d ends at offset %d but dat file is only %d bytes (%d entries total)",
+			maxEndNeedleId, maxEnd, datSize, entryCount,
+		)
+	}
+
+	glog.V(1).Infof("dat/idx consistency check passed: %d entries, max offset %d, dat size %d", entryCount, maxEnd, datSize)
+	return nil
 }

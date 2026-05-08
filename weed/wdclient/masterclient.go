@@ -142,17 +142,19 @@ func (p *masterVolumeProvider) LookupVolumeIds(ctx context.Context, volumeIds []
 type MasterClient struct {
 	*vidMapClient // Embedded cache with shared logic
 
-	FilerGroup        string
-	clientType        string
-	clientHost        pb.ServerAddress
-	rack              string
-	currentMaster     pb.ServerAddress
-	currentMasterLock sync.RWMutex
-	masters           pb.ServerDiscovery
-	grpcDialOption    grpc.DialOption
-	grpcTimeout       time.Duration // Timeout for gRPC calls to master
-	OnPeerUpdate      func(update *master_pb.ClusterNodeUpdate, startFrom time.Time)
-	OnPeerUpdateLock  sync.RWMutex
+	FilerGroup           string
+	clientType           string
+	clientHost           pb.ServerAddress
+	rack                 string
+	currentMaster        pb.ServerAddress
+	currentMasterLock    sync.RWMutex
+	masters              pb.ServerDiscovery
+	grpcDialOption       grpc.DialOption
+	grpcTimeout          time.Duration // Timeout for gRPC calls to master
+	OnPeerUpdate         func(update *master_pb.ClusterNodeUpdate, startFrom time.Time)
+	OnPeerUpdateLock     sync.RWMutex
+	OnLockRingUpdate     func(update *master_pb.LockRingUpdate)
+	OnLockRingUpdateLock sync.RWMutex
 }
 
 func NewMasterClient(grpcDialOption grpc.DialOption, filerGroup string, clientType string, clientHost pb.ServerAddress, clientDataCenter string, rack string, masters pb.ServerDiscovery) *MasterClient {
@@ -179,6 +181,12 @@ func (mc *MasterClient) SetOnPeerUpdateFn(onPeerUpdate func(update *master_pb.Cl
 	mc.OnPeerUpdateLock.Lock()
 	mc.OnPeerUpdate = onPeerUpdate
 	mc.OnPeerUpdateLock.Unlock()
+}
+
+func (mc *MasterClient) SetOnLockRingUpdateFn(fn func(update *master_pb.LockRingUpdate)) {
+	mc.OnLockRingUpdateLock.Lock()
+	mc.OnLockRingUpdate = fn
+	mc.OnLockRingUpdateLock.Unlock()
 }
 
 func (mc *MasterClient) tryAllMasters(ctx context.Context) {
@@ -226,7 +234,7 @@ func (mc *MasterClient) tryConnectToMaster(ctx context.Context, master pb.Server
 			stats.MasterClientConnectCounter.WithLabelValues(stats.FailedToKeepConnected).Inc()
 			return err
 		}
-		glog.V(0).Infof("%s.%s masterClient gRPC stream established to %s in %v", mc.FilerGroup, mc.clientType, master, time.Since(connectStartTime))
+		glog.V(1).Infof("%s.%s masterClient gRPC stream established to %s in %v", mc.FilerGroup, mc.clientType, master, time.Since(connectStartTime))
 
 		if err = stream.Send(&master_pb.KeepConnectedRequest{
 			FilerGroup:    mc.FilerGroup,
@@ -256,8 +264,8 @@ func (mc *MasterClient) tryConnectToMaster(ctx context.Context, master pb.Server
 
 		// check if it is the leader to determine whether to reset the vidMap
 		if resp.VolumeLocation != nil {
-			if resp.VolumeLocation.Leader != "" && string(master) != resp.VolumeLocation.Leader {
-				glog.V(0).Infof("master %v redirected to leader %v", master, resp.VolumeLocation.Leader)
+			if resp.VolumeLocation.Leader != "" && !master.Equals(pb.ServerAddress(resp.VolumeLocation.Leader)) {
+				glog.V(1).Infof("master %v redirected to leader %v", master, resp.VolumeLocation.Leader)
 				nextHintedLeader = pb.ServerAddress(resp.VolumeLocation.Leader)
 				stats.MasterClientConnectCounter.WithLabelValues(stats.RedirectedToLeader).Inc()
 				return nil
@@ -287,8 +295,8 @@ func (mc *MasterClient) tryConnectToMaster(ctx context.Context, master pb.Server
 			if resp.VolumeLocation != nil {
 				// Check for leader change during the stream
 				// If master announces a new leader, reconnect to it
-				if resp.VolumeLocation.Leader != "" && string(mc.GetMaster(ctx)) != resp.VolumeLocation.Leader {
-					glog.V(0).Infof("currentMaster %v redirected to leader %v", mc.GetMaster(ctx), resp.VolumeLocation.Leader)
+				if currentMaster := mc.GetMaster(ctx); resp.VolumeLocation.Leader != "" && !currentMaster.Equals(pb.ServerAddress(resp.VolumeLocation.Leader)) {
+					glog.V(1).Infof("currentMaster %v redirected to leader %v", currentMaster, resp.VolumeLocation.Leader)
 					nextHintedLeader = pb.ServerAddress(resp.VolumeLocation.Leader)
 					stats.MasterClientConnectCounter.WithLabelValues(stats.RedirectedToLeader).Inc()
 					return nil
@@ -310,6 +318,17 @@ func (mc *MasterClient) tryConnectToMaster(ctx context.Context, master pb.Server
 					}
 				}
 				mc.OnPeerUpdateLock.RUnlock()
+			}
+			if resp.LockRingUpdate != nil {
+				update := resp.LockRingUpdate
+				mc.OnLockRingUpdateLock.RLock()
+				if mc.OnLockRingUpdate != nil {
+					if update.FilerGroup == mc.FilerGroup {
+						glog.V(0).Infof("LockRing: %s@%s received ring update v%d: %v", mc.clientType, mc.clientHost, update.Version, update.Servers)
+						mc.OnLockRingUpdate(update)
+					}
+				}
+				mc.OnLockRingUpdateLock.RUnlock()
 			}
 			if err := ctx.Err(); err != nil {
 				if isCanceledErr(err) {
@@ -450,7 +469,7 @@ func (mc *MasterClient) WaitUntilConnected(ctx context.Context) {
 }
 
 func (mc *MasterClient) KeepConnectedToMaster(ctx context.Context) {
-	glog.V(0).Infof("%s.%s masterClient bootstraps with masters %v", mc.FilerGroup, mc.clientType, mc.masters)
+	glog.V(1).Infof("%s.%s masterClient bootstraps with masters %v", mc.FilerGroup, mc.clientType, mc.masters)
 	reconnectCount := 0
 	for {
 		select {

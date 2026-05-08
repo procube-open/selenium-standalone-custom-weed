@@ -43,7 +43,8 @@ type LiveLock struct {
 	lc                  *LockClient
 	owner               string
 	lockTTL             time.Duration
-	consecutiveFailures int // Track connection failures to trigger fallback
+	consecutiveFailures int   // Track connection failures to trigger fallback
+	generation          int64 // fencing token from the lock server
 }
 
 // NewShortLivedLock creates a lock with a 5-second duration
@@ -59,6 +60,46 @@ func (lc *LockClient) NewShortLivedLock(key string, owner string) (lock *LiveLoc
 	}
 	lock.retryUntilLocked(5 * time.Second)
 	return
+}
+
+// NewBlockingLongLivedLock blocks until the lock is acquired, then starts a
+// background renewal goroutine that keeps the lock alive. This combines the
+// synchronous acquisition of NewShortLivedLock with the auto-renewal of
+// StartLongLivedLock. Release with Stop().
+func (lc *LockClient) NewBlockingLongLivedLock(key, owner string, lockTTL time.Duration) *LiveLock {
+	if lockTTL == 0 {
+		lockTTL = lock_manager.LiveLockTTL
+	}
+	lock := &LiveLock{
+		key:            key,
+		hostFiler:      lc.seedFiler,
+		cancelCh:       make(chan struct{}),
+		expireAtNs:     time.Now().Add(lockTTL).UnixNano(),
+		grpcDialOption: lc.grpcDialOption,
+		self:           owner,
+		lc:             lc,
+		lockTTL:        lockTTL,
+	}
+	// Block until acquired
+	lock.retryUntilLocked(lockTTL)
+	// Start renewal goroutine using a ticker for interruptible sleep
+	go func() {
+		renewInterval := lockTTL / 2
+		ticker := time.NewTicker(renewInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-lock.cancelCh:
+				return
+			case <-ticker.C:
+				if err := lock.AttemptToLock(lockTTL); err != nil {
+					glog.V(0).Infof("lock renewal failed for %s: %v", key, err)
+					atomic.StoreInt32(&lock.isLocked, 0)
+				}
+			}
+		}
+	}()
+	return lock
 }
 
 // StartLongLivedLock starts a goroutine to lock the key and returns immediately.
@@ -214,6 +255,9 @@ func (lock *LiveLock) doLock(lockDuration time.Duration) (errorMessage string, e
 		glog.V(4).Infof("LOCK: DistributedLock response - key=%s err=%v", lock.key, err)
 		if err == nil && resp != nil {
 			lock.renewToken = resp.RenewToken
+			if resp.Generation > 0 {
+				atomic.StoreInt64(&lock.generation, resp.Generation)
+			}
 			lock.consecutiveFailures = 0 // Reset failure counter on success
 			glog.V(4).Infof("LOCK: Got renewToken for key=%s", lock.key)
 		} else {
@@ -223,7 +267,7 @@ func (lock *LiveLock) doLock(lockDuration time.Duration) (errorMessage string, e
 		}
 		if resp != nil {
 			errorMessage = resp.Error
-			if resp.LockHostMovedTo != "" && resp.LockHostMovedTo != string(previousHostFiler) {
+			if resp.LockHostMovedTo != "" && !pb.ServerAddress(resp.LockHostMovedTo).Equals(previousHostFiler) {
 				// Only log if the host actually changed
 				glog.V(2).Infof("LOCK: Host changed from %s to %s for key=%s", previousHostFiler, resp.LockHostMovedTo, lock.key)
 				lock.hostFiler = pb.ServerAddress(resp.LockHostMovedTo)
@@ -245,7 +289,7 @@ func (lock *LiveLock) doLock(lockDuration time.Duration) (errorMessage string, e
 		return err
 	})
 
-	if err != nil && lock.hostFiler != lock.lc.seedFiler {
+	if err != nil && !lock.hostFiler.Equals(lock.lc.seedFiler) {
 		lock.consecutiveFailures++
 		// Fall back to seed filer after 3 consecutive connection failures
 		if lock.consecutiveFailures >= 3 {
@@ -262,6 +306,12 @@ func (lock *LiveLock) doLock(lockDuration time.Duration) (errorMessage string, e
 
 func (lock *LiveLock) LockOwner() string {
 	return lock.owner
+}
+
+// Generation returns the fencing token for this lock.
+// It increments on each fresh acquisition and stays the same on renewal.
+func (lock *LiveLock) Generation() int64 {
+	return atomic.LoadInt64(&lock.generation)
 }
 
 // IsLocked returns true if this instance currently holds the lock

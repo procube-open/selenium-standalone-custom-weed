@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -21,6 +20,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/iam"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/seaweedfs/seaweedfs/test/testutil"
+	"github.com/seaweedfs/seaweedfs/test/volume_server/framework"
 	"github.com/seaweedfs/seaweedfs/weed/command"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -42,6 +43,7 @@ type TestCluster struct {
 	filerGrpcPort  int
 	s3Port         int
 	s3Endpoint     string
+	rustVolumeCmd  *exec.Cmd
 }
 
 func TestS3PolicyShellRevised(t *testing.T) {
@@ -701,45 +703,28 @@ func uniqueName(prefix string) string {
 
 // --- Test setup helpers ---
 
-func findAvailablePort() (int, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer listener.Close()
-	addr := listener.Addr().(*net.TCPAddr)
-	return addr.Port, nil
-}
-
-// findAvailablePortPair finds an available http port P such that P and P+10000 (grpc) are both available
-func findAvailablePortPair() (int, int, error) {
-	httpPort, err := findAvailablePort()
-	if err != nil {
-		return 0, 0, err
-	}
-	for i := 0; i < 100; i++ {
-		grpcPort, err := findAvailablePort()
-		if err != nil {
-			return 0, 0, err
-		}
-		if grpcPort != httpPort {
-			return httpPort, grpcPort, nil
-		}
-	}
-	return 0, 0, fmt.Errorf("failed to find available port pair")
-}
-
 func startMiniCluster(t *testing.T) (*TestCluster, error) {
-	masterPort, masterGrpcPort, err := findAvailablePortPair()
-	require.NoError(t, err)
-	volumePort, volumeGrpcPort, err := findAvailablePortPair()
-	require.NoError(t, err)
-	filerPort, filerGrpcPort, err := findAvailablePortPair()
-	require.NoError(t, err)
-	s3Port, s3GrpcPort, err := findAvailablePortPair()
-	require.NoError(t, err)
+	// Allocate two extra ports for admin HTTP + gRPC. Without explicit
+	// values mini falls back to 23646/33646, which collide across the
+	// sequential subtests in this package: each subtest spins up a fresh
+	// mini in a goroutine, but the previous mini's admin goroutine is
+	// still binding 23646 — so the next test's admin can never become
+	// ready and mini.go fatals on its readiness check.
+	ports := testutil.MustAllocatePorts(t, 10)
+	masterPort, masterGrpcPort := ports[0], ports[1]
+	volumePort, volumeGrpcPort := ports[2], ports[3]
+	filerPort, filerGrpcPort := ports[4], ports[5]
+	s3Port, s3GrpcPort := ports[6], ports[7]
+	adminPort, adminGrpcPort := ports[8], ports[9]
 
-	testDir := t.TempDir()
+	// Manually-managed temp dir (not t.TempDir()) so we control removal order:
+	// the dir is removed inside Stop() AFTER the mini goroutine has fully
+	// exited. Otherwise t.TempDir()'s RemoveAll cleanup races the admin
+	// plugin worker, which keeps creating files under admin/plugin/job_types/
+	// for ~1s after subtests finish, producing flaky "directory not empty"
+	// failures (see seaweedfs CI run 25352039081).
+	testDir, err := os.MkdirTemp("", "seaweed-policy-mini-")
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s3Endpoint := fmt.Sprintf("http://127.0.0.1:%d", s3Port)
@@ -761,10 +746,12 @@ func startMiniCluster(t *testing.T) (*TestCluster, error) {
 	err = os.WriteFile(securityToml, []byte("# Empty security config\n"), 0644)
 	require.NoError(t, err)
 
-	// Configure credential store for IAM tests
+	// Configure credential store for IAM tests.
+	// Use filer_etc instead of memory because the memory store does not
+	// persist groups or service accounts through LoadConfiguration/SaveConfiguration.
 	credentialToml := filepath.Join(testDir, "credential.toml")
 	credentialConfig := `
-[credential.memory]
+[credential.filer_etc]
 enabled = true
 `
 	err = os.WriteFile(credentialToml, []byte(credentialConfig), 0644)
@@ -799,6 +786,8 @@ enabled = true
 			"-filer.port.grpc=" + strconv.Itoa(filerGrpcPort),
 			"-s3.port=" + strconv.Itoa(s3Port),
 			"-s3.port.grpc=" + strconv.Itoa(s3GrpcPort),
+			"-admin.port=" + strconv.Itoa(adminPort),
+			"-admin.port.grpc=" + strconv.Itoa(adminGrpcPort),
 			"-webdav.port=0",
 			"-admin.ui=false",
 			"-master.volumeSizeLimitMB=32",
@@ -810,44 +799,133 @@ enabled = true
 		for _, cmd := range command.Commands {
 			if cmd.Name() == "mini" && cmd.Run != nil {
 				cmd.Flag.Parse(os.Args[1:])
+				// MiniClusterCtx makes runMini observe our cancel: master/
+				// volume/filer get this as their shutdownCtx, and the clients
+				// state (admin/s3/webdav/plugin worker) chains from it.
+				command.MiniClusterCtx = ctx
 				cmd.Run(cmd, cmd.Flag.Args())
+				command.MiniClusterCtx = nil
 				return
 			}
 		}
 	}()
 
 	// Wait for S3
-	err = waitForS3Ready(cluster.s3Endpoint, 60*time.Second)
-	if err != nil {
+	if !testutil.WaitForService(cluster.s3Endpoint, 60*time.Second) {
 		cancel()
-		return nil, err
+		cluster.wg.Wait()
+		os.RemoveAll(testDir)
+		return nil, fmt.Errorf("timeout waiting for S3 at %s", cluster.s3Endpoint)
 	}
+
+	// If VOLUME_SERVER_IMPL=rust, start a Rust volume server alongside weed mini
+	if os.Getenv("VOLUME_SERVER_IMPL") == "rust" {
+		if err := cluster.startRustVolumeServer(t); err != nil {
+			cancel()
+			cluster.wg.Wait()
+			os.RemoveAll(testDir)
+			return nil, fmt.Errorf("failed to start Rust volume server: %v", err)
+		}
+	}
+
 	cluster.isRunning = true
 	return cluster, nil
 }
 
-func waitForS3Ready(endpoint string, timeout time.Duration) error {
+// startRustVolumeServer starts a Rust volume server that registers with the same master.
+func (c *TestCluster) startRustVolumeServer(t *testing.T) error {
+	t.Helper()
+
+	rustBinary, err := framework.FindOrBuildRustBinary()
+	if err != nil {
+		return fmt.Errorf("resolve rust volume binary: %v", err)
+	}
+
+	rustPorts, err := testutil.AllocatePorts(2)
+	if err != nil {
+		return fmt.Errorf("find rust volume ports: %v", err)
+	}
+	rustVolumePort := rustPorts[0]
+	rustVolumeGrpcPort := rustPorts[1]
+
+	rustVolumeDir := filepath.Join(c.dataDir, "rust-volume")
+	if err := os.MkdirAll(rustVolumeDir, 0o755); err != nil {
+		return fmt.Errorf("create rust volume dir: %v", err)
+	}
+
+	securityToml := filepath.Join(c.dataDir, "security.toml")
+
+	args := []string{
+		"--port", strconv.Itoa(rustVolumePort),
+		"--port.grpc", strconv.Itoa(rustVolumeGrpcPort),
+		"--port.public", strconv.Itoa(rustVolumePort),
+		"--ip", "127.0.0.1",
+		"--ip.bind", "127.0.0.1",
+		"--dir", rustVolumeDir,
+		"--max", "16",
+		"--master", "127.0.0.1:" + strconv.Itoa(c.masterPort),
+		"--securityFile", securityToml,
+		"--preStopSeconds", "0",
+	}
+
+	logFile, err := os.Create(filepath.Join(c.dataDir, "rust-volume.log"))
+	if err != nil {
+		return fmt.Errorf("create rust volume log: %v", err)
+	}
+
+	c.rustVolumeCmd = exec.Command(rustBinary, args...)
+	c.rustVolumeCmd.Dir = c.dataDir
+	c.rustVolumeCmd.Stdout = logFile
+	c.rustVolumeCmd.Stderr = logFile
+	if err := c.rustVolumeCmd.Start(); err != nil {
+		logFile.Close()
+		return fmt.Errorf("start rust volume: %v", err)
+	}
+
+	rustEndpoint := fmt.Sprintf("http://127.0.0.1:%d/healthz", rustVolumePort)
+	deadline := time.Now().Add(15 * time.Second)
 	client := &http.Client{Timeout: 1 * time.Second}
-	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		resp, err := client.Get(endpoint)
+		resp, err := client.Get(rustEndpoint)
 		if err == nil {
 			resp.Body.Close()
+			t.Logf("Rust volume server ready on port %d (grpc %d)", rustVolumePort, rustVolumeGrpcPort)
 			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return fmt.Errorf("timeout waiting for S3")
+	return fmt.Errorf("rust volume server not ready after 15s (port %d)", rustVolumePort)
 }
 
 func (c *TestCluster) Stop() {
+	// Stop Rust volume server first
+	if c.rustVolumeCmd != nil && c.rustVolumeCmd.Process != nil {
+		c.rustVolumeCmd.Process.Kill()
+		c.rustVolumeCmd.Wait()
+	}
+
 	if c.cancel != nil {
 		c.cancel()
 	}
-	if c.isRunning {
-		time.Sleep(500 * time.Millisecond)
+
+	// Wait for the mini goroutine to fully return before removing the data
+	// dir. runMini observes MiniClusterCtx and returns once cancel fires; the
+	// admin/s3/webdav/plugin-worker shutdown is gated by the same ctx via
+	// resetMiniClients. The deadline is generous because admin shutdown can
+	// take several seconds when graceful-stops are draining.
+	done := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		fmt.Println("Warning: TestCluster.Stop timed out waiting for mini goroutine")
 	}
-	// Simplified stop
+
+	// Reset all mini flags so a subsequent in-process startMiniCluster sees
+	// fresh state.
 	for _, cmd := range command.Commands {
 		if cmd.Name() == "mini" {
 			cmd.Flag.VisitAll(func(f *flag.Flag) {
@@ -855,6 +933,10 @@ func (c *TestCluster) Stop() {
 			})
 			break
 		}
+	}
+
+	if c.dataDir != "" {
+		os.RemoveAll(c.dataDir)
 	}
 }
 

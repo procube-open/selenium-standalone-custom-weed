@@ -539,19 +539,15 @@ func testJWTAuthentication(t *testing.T, iam *IdentityAccessManagement, token st
 	return iam.authenticateJWTWithIAM(req)
 }
 
-func testJWTAuthorization(t *testing.T, iam *IdentityAccessManagement, identity *Identity, action Action, bucket, object, token string) bool {
-	return testJWTAuthorizationWithRole(t, iam, identity, action, bucket, object, token, "TestRole")
-}
-
 func testJWTAuthorizationWithRole(t *testing.T, iam *IdentityAccessManagement, identity *Identity, action Action, bucket, object, token, roleName string) bool {
 	// Create test request
 	req := httptest.NewRequest("GET", "/"+bucket+"/"+object, http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("X-SeaweedFS-Session-Token", token)
+	req.Header.Set(s3_constants.SeaweedFSSessionTokenHeader, token)
 
 	// Use a proper principal ARN format that matches what STS would generate
 	principalArn := "arn:aws:sts::assumed-role/" + roleName + "/test-session"
-	req.Header.Set("X-SeaweedFS-Principal", principalArn)
+	req.Header.Set(s3_constants.SeaweedFSPrincipalHeader, principalArn)
 
 	// Test authorization
 	if iam.iamIntegration == nil {

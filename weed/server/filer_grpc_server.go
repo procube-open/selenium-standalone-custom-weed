@@ -160,6 +160,9 @@ func (fs *FilerServer) lookupFileId(ctx context.Context, fileId string) (targetU
 func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntryRequest) (resp *filer_pb.CreateEntryResponse, err error) {
 
 	glog.V(4).InfofCtx(ctx, "CreateEntry %v/%v", req.Directory, req.Entry.Name)
+	if len(req.Entry.HardLinkId) > 0 {
+		glog.V(4).InfofCtx(ctx, "CreateEntry %s/%s with HardLinkId %x counter=%d", req.Directory, req.Entry.Name, req.Entry.HardLinkId, req.Entry.HardLinkCounter)
+	}
 
 	resp = &filer_pb.CreateEntryResponse{}
 
@@ -212,6 +215,9 @@ func (fs *FilerServer) CreateEntry(ctx context.Context, req *filer_pb.CreateEntr
 func (fs *FilerServer) UpdateEntry(ctx context.Context, req *filer_pb.UpdateEntryRequest) (*filer_pb.UpdateEntryResponse, error) {
 
 	glog.V(4).InfofCtx(ctx, "UpdateEntry %v", req)
+	if len(req.Entry.HardLinkId) > 0 {
+		glog.V(4).InfofCtx(ctx, "UpdateEntry %s/%s with HardLinkId %x counter=%d", req.Directory, req.Entry.Name, req.Entry.HardLinkId, req.Entry.HardLinkCounter)
+	}
 
 	fullpath := util.Join(req.Directory, req.Entry.Name)
 	entry, err := fs.filer.FindEntry(ctx, util.FullPath(fullpath))
@@ -382,17 +388,17 @@ func (fs *FilerServer) DeleteEntry(ctx context.Context, req *filer_pb.DeleteEntr
 
 func (fs *FilerServer) AssignVolume(ctx context.Context, req *filer_pb.AssignVolumeRequest) (resp *filer_pb.AssignVolumeResponse, err error) {
 
-	if req.DiskType == "" {
-		req.DiskType = fs.option.DiskType
-	}
-
-	so, err := fs.detectStorageOption(ctx, req.Path, req.Collection, req.Replication, req.TtlSec, req.DiskType, req.DataCenter, req.Rack, req.DataNode)
+	so, err := fs.resolveAssignStorageOption(ctx, req)
 	if err != nil {
 		glog.V(3).InfofCtx(ctx, "AssignVolume: %v", err)
 		return &filer_pb.AssignVolumeResponse{Error: fmt.Sprintf("assign volume: %v", err)}, nil
 	}
 
 	assignRequest, altRequest := so.ToAssignRequests(int(req.Count))
+	assignRequest.ExpectedDataSize = req.ExpectedDataSize
+	if altRequest != nil {
+		altRequest.ExpectedDataSize = req.ExpectedDataSize
+	}
 
 	assignResult, err := operation.Assign(ctx, fs.filer.GetMaster, fs.grpcDialOption, assignRequest, altRequest)
 	if err != nil {
@@ -416,6 +422,21 @@ func (fs *FilerServer) AssignVolume(ctx context.Context, req *filer_pb.AssignVol
 		Collection:  so.Collection,
 		Replication: so.Replication,
 	}, nil
+}
+
+func (fs *FilerServer) resolveAssignStorageOption(ctx context.Context, req *filer_pb.AssignVolumeRequest) (*operation.StorageOption, error) {
+	so, err := fs.detectStorageOption(ctx, req.Path, req.Collection, req.Replication, req.TtlSec, req.DiskType, req.DataCenter, req.Rack, req.DataNode)
+	if err != nil {
+		return nil, err
+	}
+
+	// Mirror the HTTP write path: only apply the filer's default disk when the
+	// matched locationPrefix rule did not already select one.
+	if so.DiskType == "" {
+		so.DiskType = fs.option.DiskType
+	}
+
+	return so, nil
 }
 
 func (fs *FilerServer) CollectionList(ctx context.Context, req *filer_pb.CollectionListRequest) (resp *filer_pb.CollectionListResponse, err error) {

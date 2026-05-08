@@ -13,6 +13,85 @@ type CommonResponse struct {
 	} `xml:"ResponseMetadata"`
 }
 
+// IAMTag mirrors AWS IAM's Tag list element with the Key/Value pair shape.
+type IAMTag struct {
+	Key   string `xml:"Key"`
+	Value string `xml:"Value"`
+}
+
+// OpenIDConnectProviderListEntry is one element of ListOpenIDConnectProviders.
+type OpenIDConnectProviderListEntry struct {
+	Arn string `xml:"Arn"`
+}
+
+// ListOpenIDConnectProvidersResponse is the response for ListOpenIDConnectProviders.
+type ListOpenIDConnectProvidersResponse struct {
+	XMLName                          xml.Name `xml:"https://iam.amazonaws.com/doc/2010-05-08/ ListOpenIDConnectProvidersResponse"`
+	ListOpenIDConnectProvidersResult struct {
+		OpenIDConnectProviderList []*OpenIDConnectProviderListEntry `xml:"OpenIDConnectProviderList>member"`
+	} `xml:"ListOpenIDConnectProvidersResult"`
+	CommonResponse
+}
+
+// GetOpenIDConnectProviderResponse is the response for GetOpenIDConnectProvider.
+type GetOpenIDConnectProviderResponse struct {
+	XMLName                        xml.Name `xml:"https://iam.amazonaws.com/doc/2010-05-08/ GetOpenIDConnectProviderResponse"`
+	GetOpenIDConnectProviderResult struct {
+		Url            string    `xml:"Url"`
+		ClientIDList   []string  `xml:"ClientIDList>member,omitempty"`
+		ThumbprintList []string  `xml:"ThumbprintList>member,omitempty"`
+		Tags           []*IAMTag `xml:"Tags>member,omitempty"`
+		CreateDate     string    `xml:"CreateDate,omitempty"`
+	} `xml:"GetOpenIDConnectProviderResult"`
+	CommonResponse
+}
+
+// CreateOpenIDConnectProviderResponse is the response for CreateOpenIDConnectProvider.
+type CreateOpenIDConnectProviderResponse struct {
+	XMLName                           xml.Name `xml:"https://iam.amazonaws.com/doc/2010-05-08/ CreateOpenIDConnectProviderResponse"`
+	CreateOpenIDConnectProviderResult struct {
+		OpenIDConnectProviderArn string    `xml:"OpenIDConnectProviderArn"`
+		Tags                     []*IAMTag `xml:"Tags>member,omitempty"`
+	} `xml:"CreateOpenIDConnectProviderResult"`
+	CommonResponse
+}
+
+// DeleteOpenIDConnectProviderResponse is the response for DeleteOpenIDConnectProvider.
+type DeleteOpenIDConnectProviderResponse struct {
+	XMLName xml.Name `xml:"https://iam.amazonaws.com/doc/2010-05-08/ DeleteOpenIDConnectProviderResponse"`
+	CommonResponse
+}
+
+// AddClientIDToOpenIDConnectProviderResponse is the response for AddClientIDToOpenIDConnectProvider.
+type AddClientIDToOpenIDConnectProviderResponse struct {
+	XMLName xml.Name `xml:"https://iam.amazonaws.com/doc/2010-05-08/ AddClientIDToOpenIDConnectProviderResponse"`
+	CommonResponse
+}
+
+// RemoveClientIDFromOpenIDConnectProviderResponse is the response for RemoveClientIDFromOpenIDConnectProvider.
+type RemoveClientIDFromOpenIDConnectProviderResponse struct {
+	XMLName xml.Name `xml:"https://iam.amazonaws.com/doc/2010-05-08/ RemoveClientIDFromOpenIDConnectProviderResponse"`
+	CommonResponse
+}
+
+// UpdateOpenIDConnectProviderThumbprintResponse is the response for UpdateOpenIDConnectProviderThumbprint.
+type UpdateOpenIDConnectProviderThumbprintResponse struct {
+	XMLName xml.Name `xml:"https://iam.amazonaws.com/doc/2010-05-08/ UpdateOpenIDConnectProviderThumbprintResponse"`
+	CommonResponse
+}
+
+// TagOpenIDConnectProviderResponse is the response for TagOpenIDConnectProvider.
+type TagOpenIDConnectProviderResponse struct {
+	XMLName xml.Name `xml:"https://iam.amazonaws.com/doc/2010-05-08/ TagOpenIDConnectProviderResponse"`
+	CommonResponse
+}
+
+// UntagOpenIDConnectProviderResponse is the response for UntagOpenIDConnectProvider.
+type UntagOpenIDConnectProviderResponse struct {
+	XMLName xml.Name `xml:"https://iam.amazonaws.com/doc/2010-05-08/ UntagOpenIDConnectProviderResponse"`
+	CommonResponse
+}
+
 // SetRequestId stores the request ID generated for the current HTTP request.
 func (r *CommonResponse) SetRequestId(requestID string) {
 	r.ResponseMetadata.RequestId = requestID
@@ -175,6 +254,17 @@ type ListAttachedUserPoliciesResponse struct {
 		IsTruncated      bool                  `xml:"IsTruncated"`
 		Marker           string                `xml:"Marker,omitempty"`
 	} `xml:"ListAttachedUserPoliciesResult"`
+	CommonResponse
+}
+
+// ListUserPoliciesResponse is the response for ListUserPolicies action.
+type ListUserPoliciesResponse struct {
+	XMLName                xml.Name `xml:"https://iam.amazonaws.com/doc/2010-05-08/ ListUserPoliciesResponse"`
+	ListUserPoliciesResult struct {
+		PolicyNames []string `xml:"PolicyNames>member"`
+		IsTruncated bool     `xml:"IsTruncated"`
+		Marker      string   `xml:"Marker,omitempty"`
+	} `xml:"ListUserPoliciesResult"`
 	CommonResponse
 }
 
@@ -357,6 +447,40 @@ type ListAttachedGroupPoliciesResponse struct {
 		IsTruncated      bool                  `xml:"IsTruncated"`
 		Marker           string                `xml:"Marker,omitempty"`
 	} `xml:"ListAttachedGroupPoliciesResult"`
+	CommonResponse
+}
+
+// PutGroupPolicyResponse is the response for PutGroupPolicy action.
+type PutGroupPolicyResponse struct {
+	XMLName xml.Name `xml:"https://iam.amazonaws.com/doc/2010-05-08/ PutGroupPolicyResponse"`
+	CommonResponse
+}
+
+// GetGroupPolicyResponse is the response for GetGroupPolicy action.
+type GetGroupPolicyResponse struct {
+	XMLName              xml.Name `xml:"https://iam.amazonaws.com/doc/2010-05-08/ GetGroupPolicyResponse"`
+	GetGroupPolicyResult struct {
+		GroupName      string `xml:"GroupName"`
+		PolicyName     string `xml:"PolicyName"`
+		PolicyDocument string `xml:"PolicyDocument"`
+	} `xml:"GetGroupPolicyResult"`
+	CommonResponse
+}
+
+// DeleteGroupPolicyResponse is the response for DeleteGroupPolicy action.
+type DeleteGroupPolicyResponse struct {
+	XMLName xml.Name `xml:"https://iam.amazonaws.com/doc/2010-05-08/ DeleteGroupPolicyResponse"`
+	CommonResponse
+}
+
+// ListGroupPoliciesResponse is the response for ListGroupPolicies action.
+type ListGroupPoliciesResponse struct {
+	XMLName                 xml.Name `xml:"https://iam.amazonaws.com/doc/2010-05-08/ ListGroupPoliciesResponse"`
+	ListGroupPoliciesResult struct {
+		PolicyNames []string `xml:"PolicyNames>member"`
+		IsTruncated bool     `xml:"IsTruncated"`
+		Marker      string   `xml:"Marker,omitempty"`
+	} `xml:"ListGroupPoliciesResult"`
 	CommonResponse
 }
 

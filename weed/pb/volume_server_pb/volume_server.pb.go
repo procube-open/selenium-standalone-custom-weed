@@ -1322,11 +1322,14 @@ func (*VolumeUnmountResponse) Descriptor() ([]byte, []int) {
 }
 
 type VolumeDeleteRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VolumeId      uint32                 `protobuf:"varint,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
-	OnlyEmpty     bool                   `protobuf:"varint,2,opt,name=only_empty,json=onlyEmpty,proto3" json:"only_empty,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	VolumeId  uint32                 `protobuf:"varint,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
+	OnlyEmpty bool                   `protobuf:"varint,2,opt,name=only_empty,json=onlyEmpty,proto3" json:"only_empty,omitempty"`
+	// when true, do not remove the cloud-tier object backing the volume.
+	// used for moves where another server is taking over the same .vif.
+	KeepRemoteData bool `protobuf:"varint,3,opt,name=keep_remote_data,json=keepRemoteData,proto3" json:"keep_remote_data,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *VolumeDeleteRequest) Reset() {
@@ -1369,6 +1372,13 @@ func (x *VolumeDeleteRequest) GetVolumeId() uint32 {
 func (x *VolumeDeleteRequest) GetOnlyEmpty() bool {
 	if x != nil {
 		return x.OnlyEmpty
+	}
+	return false
+}
+
+func (x *VolumeDeleteRequest) GetKeepRemoteData() bool {
+	if x != nil {
+		return x.KeepRemoteData
 	}
 	return false
 }
@@ -2333,6 +2343,7 @@ type ReceiveFileInfo struct {
 	IsEcVolume    bool                   `protobuf:"varint,4,opt,name=is_ec_volume,json=isEcVolume,proto3" json:"is_ec_volume,omitempty"`
 	ShardId       uint32                 `protobuf:"varint,5,opt,name=shard_id,json=shardId,proto3" json:"shard_id,omitempty"`
 	FileSize      uint64                 `protobuf:"varint,6,opt,name=file_size,json=fileSize,proto3" json:"file_size,omitempty"`
+	DiskId        uint32                 `protobuf:"varint,7,opt,name=disk_id,json=diskId,proto3" json:"disk_id,omitempty"` // EC shard disk; 0 = auto-select (see VolumeEcShardsCopyRequest.disk_id)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2405,6 +2416,13 @@ func (x *ReceiveFileInfo) GetShardId() uint32 {
 func (x *ReceiveFileInfo) GetFileSize() uint64 {
 	if x != nil {
 		return x.FileSize
+	}
+	return 0
+}
+
+func (x *ReceiveFileInfo) GetDiskId() uint32 {
+	if x != nil {
+		return x.DiskId
 	}
 	return 0
 }
@@ -5578,9 +5596,10 @@ type ScrubVolumeRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Mode  VolumeScrubMode        `protobuf:"varint,1,opt,name=mode,proto3,enum=volume_server_pb.VolumeScrubMode" json:"mode,omitempty"`
 	// optional list of volume IDs to scrub. if empty, all volumes for the server are scrubbed.
-	VolumeIds     []uint32 `protobuf:"varint,2,rep,packed,name=volume_ids,json=volumeIds,proto3" json:"volume_ids,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	VolumeIds                 []uint32 `protobuf:"varint,2,rep,packed,name=volume_ids,json=volumeIds,proto3" json:"volume_ids,omitempty"`
+	MarkBrokenVolumesReadonly bool     `protobuf:"varint,3,opt,name=mark_broken_volumes_readonly,json=markBrokenVolumesReadonly,proto3" json:"mark_broken_volumes_readonly,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *ScrubVolumeRequest) Reset() {
@@ -5625,6 +5644,13 @@ func (x *ScrubVolumeRequest) GetVolumeIds() []uint32 {
 		return x.VolumeIds
 	}
 	return nil
+}
+
+func (x *ScrubVolumeRequest) GetMarkBrokenVolumesReadonly() bool {
+	if x != nil {
+		return x.MarkBrokenVolumesReadonly
+	}
+	return false
 }
 
 type ScrubVolumeResponse struct {
@@ -6808,11 +6834,12 @@ const file_volume_server_proto_rawDesc = "" +
 	"\x13VolumeMountResponse\"3\n" +
 	"\x14VolumeUnmountRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\rR\bvolumeId\"\x17\n" +
-	"\x15VolumeUnmountResponse\"Q\n" +
+	"\x15VolumeUnmountResponse\"{\n" +
 	"\x13VolumeDeleteRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\rR\bvolumeId\x12\x1d\n" +
 	"\n" +
-	"only_empty\x18\x02 \x01(\bR\tonlyEmpty\"\x16\n" +
+	"only_empty\x18\x02 \x01(\bR\tonlyEmpty\x12(\n" +
+	"\x10keep_remote_data\x18\x03 \x01(\bR\x0ekeepRemoteData\"\x16\n" +
 	"\x14VolumeDeleteResponse\"R\n" +
 	"\x19VolumeMarkReadonlyRequest\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\rR\bvolumeId\x12\x18\n" +
@@ -6874,7 +6901,7 @@ const file_volume_server_proto_rawDesc = "" +
 	"\x12ReceiveFileRequest\x127\n" +
 	"\x04info\x18\x01 \x01(\v2!.volume_server_pb.ReceiveFileInfoH\x00R\x04info\x12#\n" +
 	"\ffile_content\x18\x02 \x01(\fH\x00R\vfileContentB\x06\n" +
-	"\x04data\"\xba\x01\n" +
+	"\x04data\"\xd3\x01\n" +
 	"\x0fReceiveFileInfo\x12\x1b\n" +
 	"\tvolume_id\x18\x01 \x01(\rR\bvolumeId\x12\x10\n" +
 	"\x03ext\x18\x02 \x01(\tR\x03ext\x12\x1e\n" +
@@ -6884,7 +6911,8 @@ const file_volume_server_proto_rawDesc = "" +
 	"\fis_ec_volume\x18\x04 \x01(\bR\n" +
 	"isEcVolume\x12\x19\n" +
 	"\bshard_id\x18\x05 \x01(\rR\ashardId\x12\x1b\n" +
-	"\tfile_size\x18\x06 \x01(\x04R\bfileSize\"P\n" +
+	"\tfile_size\x18\x06 \x01(\x04R\bfileSize\x12\x17\n" +
+	"\adisk_id\x18\a \x01(\rR\x06diskId\"P\n" +
 	"\x13ReceiveFileResponse\x12#\n" +
 	"\rbytes_written\x18\x01 \x01(\x04R\fbytesWritten\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\"`\n" +
@@ -7146,11 +7174,12 @@ const file_volume_server_proto_rawDesc = "" +
 	"public_url\x18\x02 \x01(\tR\tpublicUrl\x12\x1b\n" +
 	"\tgrpc_port\x18\x03 \x01(\x05R\bgrpcPort\"2\n" +
 	"\x1bFetchAndWriteNeedleResponse\x12\x13\n" +
-	"\x05e_tag\x18\x01 \x01(\tR\x04eTag\"j\n" +
+	"\x05e_tag\x18\x01 \x01(\tR\x04eTag\"\xab\x01\n" +
 	"\x12ScrubVolumeRequest\x125\n" +
 	"\x04mode\x18\x01 \x01(\x0e2!.volume_server_pb.VolumeScrubModeR\x04mode\x12\x1d\n" +
 	"\n" +
-	"volume_ids\x18\x02 \x03(\rR\tvolumeIds\"\xa1\x01\n" +
+	"volume_ids\x18\x02 \x03(\rR\tvolumeIds\x12?\n" +
+	"\x1cmark_broken_volumes_readonly\x18\x03 \x01(\bR\x19markBrokenVolumesReadonly\"\xa1\x01\n" +
 	"\x13ScrubVolumeResponse\x12#\n" +
 	"\rtotal_volumes\x18\x01 \x01(\x04R\ftotalVolumes\x12\x1f\n" +
 	"\vtotal_files\x18\x02 \x01(\x04R\n" +

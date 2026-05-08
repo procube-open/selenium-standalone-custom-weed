@@ -108,6 +108,8 @@ func (s *WorkerGrpcServer) StartWithTLS(port int) error {
 	go s.cleanupRoutine()
 	go s.activeLogFetchLoop()
 
+	pb.ServeGrpcOnLocalSocket(grpcServer, port)
+
 	// Start serving in a goroutine
 	go func() {
 		if err := s.grpcServer.Serve(listener); err != nil {
@@ -783,15 +785,6 @@ func (s *WorkerGrpcServer) RequestTaskLogsFromAllWorkers(taskID string, maxEntri
 	}
 
 	return results, nil
-}
-
-// convertTaskParameters converts task parameters to protobuf format
-func convertTaskParameters(params map[string]interface{}) map[string]string {
-	result := make(map[string]string)
-	for key, value := range params {
-		result[key] = fmt.Sprintf("%v", value)
-	}
-	return result
 }
 
 func findClientAddress(ctx context.Context) string {

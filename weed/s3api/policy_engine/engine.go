@@ -162,6 +162,16 @@ func (engine *PolicyEngine) evaluateStatement(stmt *CompiledStatement, args *Pol
 	if !matchedAction {
 		matchedAction = engine.matchesDynamicPatterns(stmt.DynamicActionPatterns, args.Action, args)
 	}
+	// Multipart upload actions (CreateMultipartUpload, UploadPart, CompleteMultipartUpload, etc.)
+	// are implicitly allowed by s3:PutObject, since multipart upload is an implementation
+	// detail of putting objects. Check if this is a multipart action and the statement
+	// grants s3:PutObject.
+	if !matchedAction && multipartActionSet[args.Action] {
+		matchedAction = engine.matchesPatterns(stmt.ActionPatterns, "s3:PutObject")
+		if !matchedAction {
+			matchedAction = engine.matchesDynamicPatterns(stmt.DynamicActionPatterns, "s3:PutObject", args)
+		}
+	}
 	if !matchedAction {
 		return false
 	}
@@ -210,7 +220,15 @@ func (engine *PolicyEngine) evaluateStatement(stmt *CompiledStatement, args *Pol
 
 	// Check conditions
 	if len(stmt.Statement.Condition) > 0 {
-		match := EvaluateConditions(stmt.Statement.Condition, args.Conditions, args.ObjectEntry, args.Claims)
+		condCtx := args.Conditions
+		// Multipart continuation actions (UploadPart, UploadPartCopy) inherit SSE
+		// from CreateMultipartUpload and do not carry their own SSE header.
+		// Inject the real inherited algorithm so Null/StringEquals conditions
+		// evaluate against the value that was set at upload initiation.
+		if IsMultipartContinuationAction(args.Action) {
+			condCtx = injectSSEForMultipart(args.Conditions, args.InheritedSSEAlgorithm)
+		}
+		match := EvaluateConditions(stmt.Statement.Condition, condCtx, args.ObjectEntry, args.Claims)
 		if !match {
 			return false
 		}
@@ -435,7 +453,60 @@ func ExtractConditionValuesFromRequest(r *http.Request) map[string][]string {
 		}
 	}
 
+	// Normalize s3:x-amz-server-side-encryption value to canonical form.
+	// AWS accepts "AES256" case-insensitively; normalise so that policy
+	// StringEquals conditions work regardless of client capitalisation.
+	const sseKey = "s3:x-amz-server-side-encryption"
+	if sseVals, ok := values[sseKey]; ok {
+		normalized := make([]string, len(sseVals))
+		for i, v := range sseVals {
+			switch strings.ToUpper(v) {
+			case "AES256":
+				normalized[i] = "AES256"
+			case "AWS:KMS":
+				normalized[i] = "aws:kms"
+			default:
+				normalized[i] = v
+			}
+		}
+		values[sseKey] = normalized
+	}
+
 	return values
+}
+
+// IsMultipartContinuationAction returns true for actions that do not carry
+// their own SSE header because SSE is inherited from CreateMultipartUpload.
+func IsMultipartContinuationAction(action string) bool {
+	return action == "s3:UploadPart" || action == "s3:UploadPartCopy"
+}
+
+// injectSSEForMultipart returns a condition context augmented with the
+// inherited SSE algorithm for multipart continuation actions.
+//
+// UploadPart and UploadPartCopy do not re-send the SSE header because
+// encryption is set once at CreateMultipartUpload. The caller supplies
+// inheritedSSE (the canonical algorithm, e.g. "AES256" or "aws:kms") so
+// that Null/StringEquals conditions on s3:x-amz-server-side-encryption
+// evaluate against the real value.
+//
+// If inheritedSSE is empty (no SSE was requested at initiation), the
+// conditions map is returned unchanged so Null("true") will correctly
+// match and deny the request.
+func injectSSEForMultipart(conditions map[string][]string, inheritedSSE string) map[string][]string {
+	const sseKey = "s3:x-amz-server-side-encryption"
+	if inheritedSSE == "" {
+		return conditions // no SSE at upload initiation; let Null("true") fire
+	}
+	if _, exists := conditions[sseKey]; exists {
+		return conditions // SSE header was actually sent on this request
+	}
+	modified := make(map[string][]string, len(conditions)+1)
+	for k, v := range conditions {
+		modified[k] = v
+	}
+	modified[sseKey] = []string{inheritedSSE}
+	return modified
 }
 
 // extractSourceIP returns the best-effort client IP address for condition evaluation.
@@ -547,92 +618,6 @@ func BuildActionName(action string) string {
 		return action
 	}
 	return fmt.Sprintf("s3:%s", action)
-}
-
-// IsReadAction checks if an action is a read action
-func IsReadAction(action string) bool {
-	readActions := []string{
-		"s3:GetObject",
-		"s3:GetObjectVersion",
-		"s3:GetObjectAcl",
-		"s3:GetObjectVersionAcl",
-		"s3:GetObjectTagging",
-		"s3:GetObjectVersionTagging",
-		"s3:ListBucket",
-		"s3:ListBucketVersions",
-		"s3:GetBucketLocation",
-		"s3:GetBucketVersioning",
-		"s3:GetBucketAcl",
-		"s3:GetBucketCors",
-		"s3:GetBucketPolicy",
-		"s3:GetBucketTagging",
-		"s3:GetBucketNotification",
-		"s3:GetBucketObjectLockConfiguration",
-		"s3:GetObjectRetention",
-		"s3:GetObjectLegalHold",
-	}
-
-	for _, readAction := range readActions {
-		if action == readAction {
-			return true
-		}
-	}
-	return false
-}
-
-// IsWriteAction checks if an action is a write action
-func IsWriteAction(action string) bool {
-	writeActions := []string{
-		"s3:PutObject",
-		"s3:PutObjectAcl",
-		"s3:PutObjectTagging",
-		"s3:DeleteObject",
-		"s3:DeleteObjectVersion",
-		"s3:DeleteObjectTagging",
-		"s3:AbortMultipartUpload",
-		"s3:ListMultipartUploads",
-		"s3:ListParts",
-		"s3:PutBucketAcl",
-		"s3:PutBucketCors",
-		"s3:PutBucketPolicy",
-		"s3:PutBucketTagging",
-		"s3:PutBucketNotification",
-		"s3:PutBucketVersioning",
-		"s3:DeleteBucketPolicy",
-		"s3:DeleteBucketTagging",
-		"s3:DeleteBucketCors",
-		"s3:PutBucketObjectLockConfiguration",
-		"s3:PutObjectRetention",
-		"s3:PutObjectLegalHold",
-		"s3:BypassGovernanceRetention",
-	}
-
-	for _, writeAction := range writeActions {
-		if action == writeAction {
-			return true
-		}
-	}
-	return false
-}
-
-// GetBucketNameFromArn extracts bucket name from ARN
-func GetBucketNameFromArn(arn string) string {
-	if strings.HasPrefix(arn, "arn:aws:s3:::") {
-		parts := strings.SplitN(arn[13:], "/", 2)
-		return parts[0]
-	}
-	return ""
-}
-
-// GetObjectNameFromArn extracts object name from ARN
-func GetObjectNameFromArn(arn string) string {
-	if strings.HasPrefix(arn, "arn:aws:s3:::") {
-		parts := strings.SplitN(arn[13:], "/", 2)
-		if len(parts) > 1 {
-			return parts[1]
-		}
-	}
-	return ""
 }
 
 // GetPolicyStatements returns all policy statements for a bucket

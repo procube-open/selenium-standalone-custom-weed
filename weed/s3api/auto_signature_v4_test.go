@@ -132,6 +132,33 @@ func TestCheckaAnonymousRequestAuthType(t *testing.T) {
 
 }
 
+// TestAnonymousListBucketsWithPrefixAction verifies that an anonymous identity
+// holding a prefix-scoped List action (e.g. "List:prefix-*") is not denied at
+// the global auth layer when issuing ListBuckets. The per-bucket permission
+// check happens inside ListBucketsHandler, so the global auth step must let
+// the request through.
+//
+// Regression test for https://github.com/seaweedfs/seaweedfs/issues/9072
+func TestAnonymousListBucketsWithPrefixAction(t *testing.T) {
+	iam := &IdentityAccessManagement{
+		hashes:       make(map[string]*sync.Pool),
+		hashCounters: make(map[string]*int32),
+	}
+	_ = iam.loadS3ApiConfiguration(&iam_pb.S3ApiConfiguration{
+		Identities: []*iam_pb.Identity{
+			{
+				Name:    s3_constants.AccountAnonymousId,
+				Actions: []string{"Read:prefix-*", "List:prefix-*"},
+			},
+		},
+	})
+
+	req := mustNewRequest(http.MethodGet, "http://127.0.0.1:9000/", 0, nil, t)
+	if _, s3Error := iam.authRequest(req, s3_constants.ACTION_LIST); s3Error != s3err.ErrNone {
+		t.Errorf("anonymous ListBuckets with prefix-scoped List action: want ErrNone, got %d", s3Error)
+	}
+}
+
 func TestCheckAdminRequestAuthType(t *testing.T) {
 	iam := &IdentityAccessManagement{
 		hashes:       make(map[string]*sync.Pool),
@@ -1039,23 +1066,11 @@ func getMD5HashBase64(data []byte) string {
 	return base64.StdEncoding.EncodeToString(getMD5Sum(data))
 }
 
-// getSHA256Sum returns SHA-256 sum of given data.
-func getSHA256Sum(data []byte) []byte {
-	hash := sha256.New()
-	hash.Write(data)
-	return hash.Sum(nil)
-}
-
 // getMD5Sum returns MD5 sum of given data.
 func getMD5Sum(data []byte) []byte {
 	hash := md5.New()
 	hash.Write(data)
 	return hash.Sum(nil)
-}
-
-// getMD5Hash returns MD5 hash in hex encoding of given data.
-func getMD5Hash(data []byte) string {
-	return hex.EncodeToString(getMD5Sum(data))
 }
 
 var ignoredHeaders = map[string]bool{

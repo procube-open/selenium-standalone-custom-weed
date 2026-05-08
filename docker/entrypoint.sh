@@ -37,17 +37,21 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 isArgPassed() {
+  # Match both `-flag` and `--flag` (and their `=value` forms): the Go fla9
+  # library accepts both, and users may pick either form on the CLI.
   arg="$1"
   argWithEqualSign="$1="
+  argDouble="-$1"
+  argDoubleWithEqualSign="-$1="
   shift
   while [ $# -gt 0 ]; do
     passedArg="$1"
     shift
     case $passedArg in
-    "$arg")
+    "$arg"|"$argDouble")
       return 0
       ;;
-    "$argWithEqualSign"*)
+    "$argWithEqualSign"*|"$argDoubleWithEqualSign"*)
       return 0
       ;;
     esac
@@ -72,6 +76,20 @@ case "$1" in
   	exec /usr/bin/weed -logtostderr=true volume $ARGS $@
 	;;
 
+  'volume-rust')
+  	ARGS="-dir /data -max 0"
+  	if isArgPassed "-max" "$@"; then
+  	  ARGS="-dir /data"
+  	fi
+  	shift
+  	if [ ! -s /usr/bin/weed-volume ]; then
+  	  echo "Error: Rust volume server is not available on this platform ($(uname -m))." >&2
+  	  echo "Use 'volume' for the Go volume server instead." >&2
+  	  exit 1
+  	fi
+  	exec /usr/bin/weed-volume $ARGS $@
+	;;
+
   'server')
   	ARGS="-dir=/data -volume.max=0 -master.volumeSizeLimitMB=1024"
   	if isArgPassed "-volume.max" "$@"; then
@@ -79,6 +97,15 @@ case "$1" in
   	fi
  	shift
   	exec /usr/bin/weed -logtostderr=true server $ARGS $@
+  	;;
+
+  'mini')
+  	ARGS="-dir=/data"
+  	if isArgPassed "-dir" "$@"; then
+  	  ARGS=""
+  	fi
+  	shift
+  	exec /usr/bin/weed -logtostderr=true mini $ARGS $@
   	;;
 
   'filer')

@@ -154,8 +154,26 @@ func NewStore(
 	}
 	wg.Wait()
 
+	// After every DiskLocation has finished its per-disk EC scan, sweep the
+	// store for shards that live on a disk without local index files and
+	// load them by reaching across to a sibling disk's .ecx / .ecj / .vif.
+	// This is the volume-server side of issue #9212: ec.balance can move
+	// shards onto a destination node's second disk while leaving the index
+	// on the disk that already held the volume, and without this pass those
+	// orphan shards stay invisible to the master.
+	s.reconcileEcShardsAcrossDisks()
+
+	// Resolve state.pb's directory via the first disk location so it inherits
+	// the same `~` expansion and empty-idxFolder fallback used for .idx files,
+	// and is never written as a relative path against the process CWD (#9173).
+	stateDir := idxFolder
+	if len(s.Locations) > 0 {
+		stateDir = s.Locations[0].IdxDirectory
+	} else if stateDir != "" {
+		stateDir = util.ResolvePath(stateDir)
+	}
 	var err error
-	s.State, err = NewState(idxFolder)
+	s.State, err = NewState(stateDir)
 	if err != nil {
 		glog.Fatalf("failed to resolve state for volume %s: %v", id, err)
 	}
@@ -376,7 +394,12 @@ func (s *Store) CollectHeartbeat() *master_pb.Heartbeat {
 	collectionVolumeDeletedBytes := make(map[string]int64)
 	collectionVolumeReadOnlyCount := make(map[string]map[string]uint8)
 	for _, location := range s.Locations {
+		// keepRemoteData is parallel to deleteVids: true entries preserve the
+		// cloud-tier object on Volume.Destroy. IO-error deletions on a
+		// remote-tiered volume must not nuke the remote object — the error
+		// is local/transient and the cloud copy is the source of truth.
 		var deleteVids []needle.VolumeId
+		var keepRemoteData []bool
 		effectiveMaxCount := location.MaxVolumeCount
 		if location.isDiskSpaceLow {
 			usedSlots := int32(location.LocalVolumesLen())
@@ -401,6 +424,7 @@ func (s *Store) CollectHeartbeat() *master_pb.Heartbeat {
 
 			if v.lastIoError != nil {
 				deleteVids = append(deleteVids, v.Id)
+				keepRemoteData = append(keepRemoteData, v.HasRemoteFile())
 				shouldDeleteVolume = true
 				glog.Warningf("volume %d has IO error: %v", v.Id, v.lastIoError)
 			} else {
@@ -410,6 +434,7 @@ func (s *Store) CollectHeartbeat() *master_pb.Heartbeat {
 					if v.expiredLongEnough(MAX_TTL_VOLUME_REMOVAL_DELAY) {
 						if !shouldDeleteVolume {
 							deleteVids = append(deleteVids, v.Id)
+							keepRemoteData = append(keepRemoteData, false)
 							shouldDeleteVolume = true
 						}
 					} else {
@@ -458,8 +483,8 @@ func (s *Store) CollectHeartbeat() *master_pb.Heartbeat {
 		if len(deleteVids) > 0 {
 			// delete expired volumes.
 			location.volumesLock.Lock()
-			for _, vid := range deleteVids {
-				found, err := location.deleteVolumeById(vid, false)
+			for i, vid := range deleteVids {
+				found, err := location.deleteVolumeById(vid, false, keepRemoteData[i])
 				if err == nil {
 					if found {
 						glog.V(0).Infof("volume %d is deleted", vid)
@@ -707,7 +732,7 @@ func (s *Store) UnmountVolume(i needle.VolumeId) error {
 	return fmt.Errorf("volume %d not found on disk", i)
 }
 
-func (s *Store) DeleteVolume(i needle.VolumeId, onlyEmpty bool) error {
+func (s *Store) DeleteVolume(i needle.VolumeId, onlyEmpty bool, keepRemoteData bool) error {
 	v := s.findVolume(i)
 	if v == nil {
 		return fmt.Errorf("delete volume %d not found on disk", i)
@@ -722,7 +747,7 @@ func (s *Store) DeleteVolume(i needle.VolumeId, onlyEmpty bool) error {
 		DiskId:           v.diskId,
 	}
 	for _, location := range s.Locations {
-		err := location.DeleteVolume(i, onlyEmpty)
+		err := location.DeleteVolume(i, onlyEmpty, keepRemoteData)
 		if err == nil {
 			glog.V(0).Infof("DeleteVolume %d", i)
 			s.DeletedVolumesChan <- message
@@ -798,7 +823,7 @@ func (s *Store) MaybeAdjustVolumeMax() (hasChanges bool) {
 			}
 			volCount := diskLocation.VolumesLen()
 			ecShardCount := diskLocation.EcShardCount()
-			maxVolumeCount := int32(volCount) + int32((ecShardCount+erasure_coding.DataShardsCount)/erasure_coding.DataShardsCount)
+			maxVolumeCount := int32(volCount) + int32((ecShardCount+erasure_coding.DataShardsCount-1)/erasure_coding.DataShardsCount)
 			if unclaimedSpaces > int64(volumeSizeLimit) {
 				maxVolumeCount += int32(uint64(unclaimedSpaces)/volumeSizeLimit) - 1
 			}

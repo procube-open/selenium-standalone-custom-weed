@@ -119,7 +119,7 @@ func (c *commandVolumeMerge) Do(args []string, commandEnv *CommandEnv, writer io
 		if !cleanupTarget {
 			return
 		}
-		if delErr := deleteVolume(commandEnv.option.GrpcDialOption, volumeId, targetServer, false); delErr != nil {
+		if delErr := deleteVolume(commandEnv.option.GrpcDialOption, volumeId, targetServer, false, false); delErr != nil {
 			glog.Warningf("failed to clean up temporary merge volume %d on %s: %v", volumeId, targetServer, delErr)
 		}
 	}()
@@ -180,7 +180,7 @@ func (c *commandVolumeMerge) Do(args []string, commandEnv *CommandEnv, writer io
 		}
 	}
 
-	if err = deleteVolume(commandEnv.option.GrpcDialOption, volumeId, targetServer, false); err != nil {
+	if err = deleteVolume(commandEnv.option.GrpcDialOption, volumeId, targetServer, false, false); err != nil {
 		return err
 	}
 	cleanupTarget = false
@@ -493,7 +493,7 @@ func ensureVolumeReadonly(commandEnv *CommandEnv, replicas []*VolumeReplica) ([]
 
 func isReplicaServer(target pb.ServerAddress, replicas []*VolumeReplica) bool {
 	for _, replica := range replicas {
-		if pb.NewServerAddressFromDataNode(replica.location.dataNode) == target {
+		if pb.NewServerAddressFromDataNode(replica.location.dataNode).Equals(target) {
 			return true
 		}
 	}

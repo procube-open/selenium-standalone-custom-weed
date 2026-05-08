@@ -2,13 +2,21 @@ package weed_server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 )
 
 func (vs *VolumeServer) ScrubVolume(ctx context.Context, req *volume_server_pb.ScrubVolumeRequest) (*volume_server_pb.ScrubVolumeResponse, error) {
+	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
+		return nil, err
+	}
 	vids := []needle.VolumeId{}
 	if len(req.GetVolumeIds()) == 0 {
 		for _, l := range vs.store.Locations {
@@ -22,6 +30,7 @@ func (vs *VolumeServer) ScrubVolume(ctx context.Context, req *volume_server_pb.S
 
 	var details []string
 	var totalVolumes, totalFiles uint64
+	var brokenVolumes []*storage.Volume
 	var brokenVolumeIds []uint32
 	for _, vid := range vids {
 		v := vs.store.GetVolume(vid)
@@ -46,11 +55,32 @@ func (vs *VolumeServer) ScrubVolume(ctx context.Context, req *volume_server_pb.S
 		totalVolumes += 1
 		totalFiles += uint64(files)
 		if len(serrs) != 0 {
-			brokenVolumeIds = append(brokenVolumeIds, uint32(vid))
+			brokenVolumes = append(brokenVolumes, v)
+			brokenVolumeIds = append(brokenVolumeIds, uint32(v.Id))
 			for _, err := range serrs {
 				details = append(details, err.Error())
 			}
 		}
+	}
+
+	errs := []error{}
+	if req.GetMarkBrokenVolumesReadonly() {
+		for _, v := range brokenVolumes {
+			if err := vs.makeVolumeReadonly(ctx, v, true); err != nil {
+				errs = append(errs, err)
+				details = append(details, err.Error())
+			} else {
+				details = append(details, fmt.Sprintf("volume %d is now read-only", v.Id))
+			}
+		}
+	}
+
+	scrubLabels := prometheus.Labels{"mode": req.GetMode().String()}
+	stats.VolumeServerScrubLastTimeSeconds.With(scrubLabels).Set(float64(time.Now().Unix()))
+	stats.VolumeServerScrubVolumeFailures.With(scrubLabels).Add(float64(len(brokenVolumes)))
+
+	if len(errs) != 0 {
+		return nil, errors.Join(errs...)
 	}
 
 	res := &volume_server_pb.ScrubVolumeResponse{
@@ -102,13 +132,18 @@ func (vs *VolumeServer) ScrubEcVolume(ctx context.Context, req *volume_server_pb
 		totalVolumes += 1
 		totalFiles += uint64(files)
 		if len(serrs) != 0 || len(shardInfos) != 0 {
-			brokenVolumeIds = append(brokenVolumeIds, uint32(vid))
+			brokenVolumeIds = append(brokenVolumeIds, uint32(v.VolumeId))
 			brokenShardInfos = append(brokenShardInfos, shardInfos...)
 			for _, err := range serrs {
 				details = append(details, err.Error())
 			}
 		}
 	}
+
+	scrubLabels := prometheus.Labels{"mode": req.GetMode().String()}
+	stats.VolumeServerScrubLastTimeSeconds.With(scrubLabels).Set(float64(time.Now().Unix()))
+	stats.VolumeServerScrubVolumeFailures.With(scrubLabels).Add(float64(len(brokenVolumeIds)))
+	stats.VolumeServerScrubShardFailures.With(scrubLabels).Add(float64(len(brokenShardInfos)))
 
 	res := &volume_server_pb.ScrubEcVolumeResponse{
 		TotalVolumes:     totalVolumes,

@@ -69,6 +69,8 @@ type Plugin struct {
 	detectorLeaseMu sync.Mutex
 	detectorLeases  map[string]string
 
+	lanes map[SchedulerLane]*schedulerLaneState
+
 	schedulerExecMu           sync.Mutex
 	schedulerExecReservations map[string]int
 	adminScriptRunMu          sync.RWMutex
@@ -120,6 +122,7 @@ type Plugin struct {
 type streamSession struct {
 	workerID  string
 	outgoing  chan *plugin_pb.AdminToWorkerMessage
+	done      chan struct{}
 	closeOnce sync.Once
 }
 
@@ -158,6 +161,11 @@ func New(options Options) (*Plugin, error) {
 		schedulerTick = defaultSchedulerTick
 	}
 
+	lanes := make(map[SchedulerLane]*schedulerLaneState, len(AllLanes()))
+	for _, lane := range AllLanes() {
+		lanes[lane] = newLaneState(lane)
+	}
+
 	plugin := &Plugin{
 		store:                     store,
 		registry:                  NewRegistry(),
@@ -167,6 +175,7 @@ func New(options Options) (*Plugin, error) {
 		clusterContextProvider:    options.ClusterContextProvider,
 		configDefaultsProvider:    options.ConfigDefaultsProvider,
 		lockManager:               options.LockManager,
+		lanes:                     lanes,
 		sessions:                  make(map[string]*streamSession),
 		pendingSchema:             make(map[string]chan *plugin_pb.ConfigSchemaResponse),
 		pendingDetection:          make(map[string]*pendingDetectionState),
@@ -191,8 +200,10 @@ func New(options Options) (*Plugin, error) {
 	}
 
 	if plugin.clusterContextProvider != nil {
-		plugin.wg.Add(1)
-		go plugin.schedulerLoop()
+		for _, ls := range plugin.lanes {
+			plugin.wg.Add(1)
+			go plugin.laneSchedulerLoop(ls)
+		}
 	}
 	plugin.wg.Add(1)
 	go plugin.persistenceLoop()
@@ -264,6 +275,7 @@ func (r *Plugin) WorkerStream(stream plugin_pb.PluginControlService_WorkerStream
 	session := &streamSession{
 		workerID: workerID,
 		outgoing: make(chan *plugin_pb.AdminToWorkerMessage, r.outgoingBuffer),
+		done:     make(chan struct{}),
 	}
 	r.putSession(session)
 	defer r.cleanupSession(workerID)
@@ -898,8 +910,10 @@ func (r *Plugin) sendLoop(
 			return nil
 		case <-r.shutdownCh:
 			return nil
-		case msg, ok := <-session.outgoing:
-			if !ok {
+		case <-session.done:
+			return nil
+		case msg := <-session.outgoing:
+			if msg == nil {
 				return nil
 			}
 			if err := stream.Send(msg); err != nil {
@@ -920,6 +934,8 @@ func (r *Plugin) sendToWorker(workerID string, message *plugin_pb.AdminToWorkerM
 	select {
 	case <-r.shutdownCh:
 		return fmt.Errorf("plugin is shutting down")
+	case <-session.done:
+		return fmt.Errorf("worker %s session is closed", workerID)
 	case session.outgoing <- message:
 		return nil
 	case <-time.After(r.sendTimeout):
@@ -1028,6 +1044,7 @@ func (r *Plugin) ensureJobTypeConfigFromDescriptor(jobType string, descriptor *p
 			RetryLimit:                    defaults.RetryLimit,
 			RetryBackoffSeconds:           defaults.RetryBackoffSeconds,
 			JobTypeMaxRuntimeSeconds:      defaults.JobTypeMaxRuntimeSeconds,
+			ExecutionTimeoutSeconds:       defaults.ExecutionTimeoutSeconds,
 		}
 	}
 
@@ -1415,7 +1432,7 @@ func CloneConfigValueMap(in map[string]*plugin_pb.ConfigValue) map[string]*plugi
 
 func (s *streamSession) close() {
 	s.closeOnce.Do(func() {
-		close(s.outgoing)
+		close(s.done)
 	})
 }
 

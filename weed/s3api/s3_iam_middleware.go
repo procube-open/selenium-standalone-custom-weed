@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -14,7 +13,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/iam/integration"
 	"github.com/seaweedfs/seaweedfs/weed/iam/providers"
 	"github.com/seaweedfs/seaweedfs/weed/iam/sts"
-	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 )
 
@@ -252,19 +250,27 @@ func (s3iam *S3IAMIntegration) AuthorizeAction(ctx context.Context, identity *IA
 		return s3err.ErrAccessDenied
 	}
 
-	// Build resource ARN for the S3 operation
-	resourceArn := buildS3ResourceArn(bucket, objectKey)
-
 	// Extract request context for policy conditions
 	requestContext := extractRequestContext(r)
 
-	// Add s3:prefix to request context based on object key
-	// This ensures that policy conditions referencing s3:prefix (like StringLike)
-	// work correctly for both ListObjects (where objectKey is the prefix) and
-	// object operations (where we treat the object key as the prefix for matching)
-	if objectKey != "" && objectKey != "/" {
-		requestContext["s3:prefix"] = objectKey
+	// For list operations, populate the s3:prefix condition key and ensure the
+	// resource ARN stays at bucket level (matching AWS ListBucket semantics).
+	// See https://github.com/seaweedfs/seaweedfs/issues/8969
+	resourceObjectKey := objectKey
+	if action == "List" {
+		listPrefix := r.URL.Query().Get("prefix")
+		if listPrefix != "" {
+			requestContext["s3:prefix"] = listPrefix
+		} else if objectKey != "" && objectKey != "/" {
+			requestContext["s3:prefix"] = objectKey
+		} else {
+			requestContext["s3:prefix"] = ""
+		}
+		resourceObjectKey = ""
 	}
+
+	// Build resource ARN for the S3 operation
+	resourceArn := buildS3ResourceArn(bucket, resourceObjectKey)
 
 	// Add identity claims to request context for policy variables
 	// Only add claim keys if they don't already exist (to avoid overwriting request-derived context)
@@ -382,130 +388,6 @@ func buildS3ResourceArn(bucket string, objectKey string) string {
 	return "arn:aws:s3:::" + bucket + "/" + objectKey
 }
 
-// hasSpecificQueryParameters checks if the request has query parameters that indicate specific granular operations
-func hasSpecificQueryParameters(query url.Values) bool {
-	// Check for object-level operation indicators
-	objectParams := []string{
-		"acl",        // ACL operations
-		"tagging",    // Tagging operations
-		"retention",  // Object retention
-		"legal-hold", // Legal hold
-		"versions",   // Versioning operations
-	}
-
-	// Check for multipart operation indicators
-	multipartParams := []string{
-		"uploads",    // List/initiate multipart uploads
-		"uploadId",   // Part operations, complete, abort
-		"partNumber", // Upload part
-	}
-
-	// Check for bucket-level operation indicators
-	bucketParams := []string{
-		"policy",         // Bucket policy operations
-		"website",        // Website configuration
-		"cors",           // CORS configuration
-		"lifecycle",      // Lifecycle configuration
-		"notification",   // Event notification
-		"replication",    // Cross-region replication
-		"encryption",     // Server-side encryption
-		"accelerate",     // Transfer acceleration
-		"requestPayment", // Request payment
-		"logging",        // Access logging
-		"versioning",     // Versioning configuration
-		"inventory",      // Inventory configuration
-		"analytics",      // Analytics configuration
-		"metrics",        // CloudWatch metrics
-		"location",       // Bucket location
-	}
-
-	// Check if any of these parameters are present
-	allParams := append(append(objectParams, multipartParams...), bucketParams...)
-	for _, param := range allParams {
-		if _, exists := query[param]; exists {
-			return true
-		}
-	}
-
-	return false
-}
-
-// isMethodActionMismatch detects when HTTP method doesn't align with the intended S3 action
-// This provides a mechanism to use fallback action mapping when there's a semantic mismatch
-func isMethodActionMismatch(method string, fallbackAction Action) bool {
-	switch fallbackAction {
-	case s3_constants.ACTION_WRITE:
-		// WRITE actions should typically use PUT, POST, or DELETE methods
-		// GET/HEAD methods indicate read-oriented operations
-		return method == "GET" || method == "HEAD"
-
-	case s3_constants.ACTION_READ:
-		// READ actions should typically use GET or HEAD methods
-		// PUT, POST, DELETE methods indicate write-oriented operations
-		return method == "PUT" || method == "POST" || method == "DELETE"
-
-	case s3_constants.ACTION_LIST:
-		// LIST actions should typically use GET method
-		// PUT, POST, DELETE methods indicate write-oriented operations
-		return method == "PUT" || method == "POST" || method == "DELETE"
-
-	case s3_constants.ACTION_DELETE_BUCKET:
-		// DELETE_BUCKET should use DELETE method
-		// Other methods indicate different operation types
-		return method != "DELETE"
-
-	default:
-		// For unknown actions or actions that already have s3: prefix, don't assume mismatch
-		return false
-	}
-}
-
-// mapLegacyActionToIAM provides fallback mapping for legacy actions
-// This ensures backward compatibility while the system transitions to granular actions
-func mapLegacyActionToIAM(legacyAction Action) string {
-	switch legacyAction {
-	case s3_constants.ACTION_READ:
-		return "s3:GetObject" // Fallback for unmapped read operations
-	case s3_constants.ACTION_WRITE:
-		return "s3:PutObject" // Fallback for unmapped write operations
-	case s3_constants.ACTION_LIST:
-		return "s3:ListBucket" // Fallback for unmapped list operations
-	case s3_constants.ACTION_TAGGING:
-		return "s3:GetObjectTagging" // Fallback for unmapped tagging operations
-	case s3_constants.ACTION_READ_ACP:
-		return "s3:GetObjectAcl" // Fallback for unmapped ACL read operations
-	case s3_constants.ACTION_WRITE_ACP:
-		return "s3:PutObjectAcl" // Fallback for unmapped ACL write operations
-	case s3_constants.ACTION_DELETE_BUCKET:
-		return "s3:DeleteBucket" // Fallback for unmapped bucket delete operations
-	case s3_constants.ACTION_ADMIN:
-		return "s3:*" // Fallback for unmapped admin operations
-
-	// Handle granular multipart actions (already correctly mapped)
-	case s3_constants.S3_ACTION_CREATE_MULTIPART:
-		return s3_constants.S3_ACTION_CREATE_MULTIPART
-	case s3_constants.S3_ACTION_UPLOAD_PART:
-		return s3_constants.S3_ACTION_UPLOAD_PART
-	case s3_constants.S3_ACTION_COMPLETE_MULTIPART:
-		return s3_constants.S3_ACTION_COMPLETE_MULTIPART
-	case s3_constants.S3_ACTION_ABORT_MULTIPART:
-		return s3_constants.S3_ACTION_ABORT_MULTIPART
-	case s3_constants.S3_ACTION_LIST_MULTIPART_UPLOADS:
-		return s3_constants.S3_ACTION_LIST_MULTIPART_UPLOADS
-	case s3_constants.S3_ACTION_LIST_PARTS:
-		return s3_constants.S3_ACTION_LIST_PARTS
-
-	default:
-		// If it's already a properly formatted S3 action, return as-is
-		actionStr := string(legacyAction)
-		if strings.HasPrefix(actionStr, "s3:") {
-			return actionStr
-		}
-		// Fallback: convert to S3 action format
-		return "s3:" + actionStr
-	}
-}
-
 // extractRequestContext extracts request context for policy conditions
 func extractRequestContext(r *http.Request) map[string]interface{} {
 	context := make(map[string]interface{})
@@ -616,14 +498,6 @@ func ParseUnverifiedJWTToken(tokenString string) (jwt.MapClaims, error) {
 	return nil, fmt.Errorf("invalid token claims")
 }
 
-// minInt returns the minimum of two integers
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // SetIAMIntegration adds advanced IAM integration to the S3ApiServer
 func (s3a *S3ApiServer) SetIAMIntegration(iamManager *integration.IAMManager) {
 	if s3a.iam != nil {
@@ -638,79 +512,6 @@ func (s3a *S3ApiServer) SetIAMIntegration(iamManager *integration.IAMManager) {
 type EnhancedS3ApiServer struct {
 	*S3ApiServer
 	iamIntegration IAMIntegration
-}
-
-// NewEnhancedS3ApiServer creates an S3 API server with IAM integration
-func NewEnhancedS3ApiServer(baseServer *S3ApiServer, iamManager *integration.IAMManager) *EnhancedS3ApiServer {
-	// Set the IAM integration on the base server
-	baseServer.SetIAMIntegration(iamManager)
-
-	return &EnhancedS3ApiServer{
-		S3ApiServer:    baseServer,
-		iamIntegration: NewS3IAMIntegration(iamManager, "localhost:8888"),
-	}
-}
-
-// AuthenticateJWTRequest handles JWT authentication for S3 requests
-func (enhanced *EnhancedS3ApiServer) AuthenticateJWTRequest(r *http.Request) (*Identity, s3err.ErrorCode) {
-	ctx := r.Context()
-
-	// Use our IAM integration for JWT authentication
-	iamIdentity, errCode := enhanced.iamIntegration.AuthenticateJWT(ctx, r)
-	if errCode != s3err.ErrNone {
-		return nil, errCode
-	}
-
-	// Convert IAMIdentity to the existing Identity structure
-	identity := &Identity{
-		Name:    iamIdentity.Name,
-		Account: iamIdentity.Account,
-		// Note: Actions will be determined by policy evaluation
-		Actions:     []Action{}, // Empty - authorization handled by policy engine
-		PolicyNames: iamIdentity.PolicyNames,
-	}
-
-	// Store session token for later authorization
-	r.Header.Set("X-SeaweedFS-Session-Token", iamIdentity.SessionToken)
-	r.Header.Set("X-SeaweedFS-Principal", iamIdentity.Principal)
-
-	return identity, s3err.ErrNone
-}
-
-// AuthorizeRequest handles authorization for S3 requests using policy engine
-func (enhanced *EnhancedS3ApiServer) AuthorizeRequest(r *http.Request, identity *Identity, action Action) s3err.ErrorCode {
-	ctx := r.Context()
-
-	// Get session info from request headers (set during authentication)
-	sessionToken := r.Header.Get("X-SeaweedFS-Session-Token")
-	principal := r.Header.Get("X-SeaweedFS-Principal")
-
-	if sessionToken == "" || principal == "" {
-		glog.V(3).Info("No session information available for authorization")
-		return s3err.ErrAccessDenied
-	}
-
-	// Extract bucket and object from request
-	bucket, object := s3_constants.GetBucketAndObject(r)
-	prefix := s3_constants.GetPrefix(r)
-
-	// For List operations, use prefix for permission checking if available
-	if action == s3_constants.ACTION_LIST && object == "" && prefix != "" {
-		object = prefix
-	} else if (object == "/" || object == "") && prefix != "" {
-		object = prefix
-	}
-
-	// Create IAM identity for authorization
-	iamIdentity := &IAMIdentity{
-		Name:         identity.Name,
-		Principal:    principal,
-		SessionToken: sessionToken,
-		Account:      identity.Account,
-	}
-
-	// Use our IAM integration for authorization
-	return enhanced.iamIntegration.AuthorizeAction(ctx, iamIdentity, action, bucket, object, r)
 }
 
 // OIDCIdentity represents an identity validated through OIDC

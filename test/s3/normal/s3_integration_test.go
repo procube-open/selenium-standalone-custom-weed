@@ -7,9 +7,9 @@ import (
 	"encoding/base64"
 	"fmt"
 	"math/rand"
-	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -24,6 +24,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/seaweedfs/seaweedfs/test/testutil"
+	"github.com/seaweedfs/seaweedfs/test/volume_server/framework"
 	"github.com/seaweedfs/seaweedfs/weed/command"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	flag "github.com/seaweedfs/seaweedfs/weed/util/fla9"
@@ -37,18 +39,19 @@ const (
 
 // TestCluster manages the weed mini instance for integration testing
 type TestCluster struct {
-	dataDir    string
-	ctx        context.Context
-	cancel     context.CancelFunc
-	s3Client   *s3.S3
-	isRunning  bool
-	startOnce  sync.Once
-	wg         sync.WaitGroup
-	masterPort int
-	volumePort int
-	filerPort  int
-	s3Port     int
-	s3Endpoint string
+	dataDir       string
+	ctx           context.Context
+	cancel        context.CancelFunc
+	s3Client      *s3.S3
+	isRunning     bool
+	startOnce     sync.Once
+	wg            sync.WaitGroup
+	masterPort    int
+	volumePort    int
+	filerPort     int
+	s3Port        int
+	s3Endpoint    string
+	rustVolumeCmd *exec.Cmd
 }
 
 // TestS3Integration demonstrates basic S3 operations against a running weed mini instance
@@ -109,37 +112,16 @@ func TestS3Integration(t *testing.T) {
 }
 
 // findAvailablePort finds an available port by binding to port 0
-func findAvailablePort() (int, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer listener.Close()
-
-	addr := listener.Addr().(*net.TCPAddr)
-	return addr.Port, nil
-}
 
 // startMiniCluster starts a weed mini instance directly without exec.
 // Extra flags (e.g. "-s3.allowDeleteBucketNotEmpty=false") can be appended via extraArgs.
 func startMiniCluster(t *testing.T, extraArgs ...string) (*TestCluster, error) {
-	// Find available ports
-	masterPort, err := findAvailablePort()
-	if err != nil {
-		return nil, fmt.Errorf("failed to find master port: %v", err)
-	}
-	volumePort, err := findAvailablePort()
-	if err != nil {
-		return nil, fmt.Errorf("failed to find volume port: %v", err)
-	}
-	filerPort, err := findAvailablePort()
-	if err != nil {
-		return nil, fmt.Errorf("failed to find filer port: %v", err)
-	}
-	s3Port, err := findAvailablePort()
-	if err != nil {
-		return nil, fmt.Errorf("failed to find s3 port: %v", err)
-	}
+	// Allocate non-colliding ports (including gRPC offsets) for weed mini.
+	ports := testutil.MustFreeMiniPorts(t, []string{"Master", "Volume", "Filer", "S3"})
+	masterPort := ports[0]
+	volumePort := ports[1]
+	filerPort := ports[2]
+	s3Port := ports[3]
 	// Create temporary directory for test data
 	testDir := t.TempDir()
 
@@ -164,7 +146,7 @@ func startMiniCluster(t *testing.T, extraArgs ...string) (*TestCluster, error) {
 
 	// Create empty security.toml to disable JWT authentication in tests
 	securityToml := filepath.Join(testDir, "security.toml")
-	err = os.WriteFile(securityToml, []byte("# Empty security config for testing\n"), 0644)
+	err := os.WriteFile(securityToml, []byte("# Empty security config for testing\n"), 0644)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("failed to create security.toml: %v", err)
@@ -230,10 +212,17 @@ func startMiniCluster(t *testing.T, extraArgs ...string) (*TestCluster, error) {
 	}()
 
 	// Wait for S3 service to be ready
-	err = waitForS3Ready(cluster.s3Endpoint, 30*time.Second)
-	if err != nil {
+	if !testutil.WaitForService(cluster.s3Endpoint, 30*time.Second) {
 		cancel()
-		return nil, fmt.Errorf("S3 service failed to start: %v", err)
+		return nil, fmt.Errorf("S3 service failed to start at %s", cluster.s3Endpoint)
+	}
+
+	// If VOLUME_SERVER_IMPL=rust, start a Rust volume server alongside weed mini
+	if os.Getenv("VOLUME_SERVER_IMPL") == "rust" {
+		if err := cluster.startRustVolumeServer(t); err != nil {
+			cancel()
+			return nil, fmt.Errorf("failed to start Rust volume server: %v", err)
+		}
 	}
 
 	cluster.isRunning = true
@@ -257,8 +246,80 @@ func startMiniCluster(t *testing.T, extraArgs ...string) (*TestCluster, error) {
 	return cluster, nil
 }
 
+// startRustVolumeServer starts a Rust volume server that registers with the same master.
+func (c *TestCluster) startRustVolumeServer(t *testing.T) error {
+	t.Helper()
+
+	rustBinary, err := framework.FindOrBuildRustBinary()
+	if err != nil {
+		return fmt.Errorf("resolve rust volume binary: %v", err)
+	}
+
+	rustPorts, err := testutil.AllocatePorts(2)
+	if err != nil {
+		return fmt.Errorf("find rust volume ports: %v", err)
+	}
+	rustVolumePort := rustPorts[0]
+	rustVolumeGrpcPort := rustPorts[1]
+
+	rustVolumeDir := filepath.Join(c.dataDir, "rust-volume")
+	if err := os.MkdirAll(rustVolumeDir, 0o755); err != nil {
+		return fmt.Errorf("create rust volume dir: %v", err)
+	}
+
+	securityToml := filepath.Join(c.dataDir, "security.toml")
+
+	args := []string{
+		"--port", strconv.Itoa(rustVolumePort),
+		"--port.grpc", strconv.Itoa(rustVolumeGrpcPort),
+		"--port.public", strconv.Itoa(rustVolumePort),
+		"--ip", "127.0.0.1",
+		"--ip.bind", "127.0.0.1",
+		"--dir", rustVolumeDir,
+		"--max", "16",
+		"--master", "127.0.0.1:" + strconv.Itoa(c.masterPort),
+		"--securityFile", securityToml,
+		"--preStopSeconds", "0",
+	}
+
+	logFile, err := os.Create(filepath.Join(c.dataDir, "rust-volume.log"))
+	if err != nil {
+		return fmt.Errorf("create rust volume log: %v", err)
+	}
+
+	c.rustVolumeCmd = exec.Command(rustBinary, args...)
+	c.rustVolumeCmd.Dir = c.dataDir
+	c.rustVolumeCmd.Stdout = logFile
+	c.rustVolumeCmd.Stderr = logFile
+	if err := c.rustVolumeCmd.Start(); err != nil {
+		logFile.Close()
+		return fmt.Errorf("start rust volume: %v", err)
+	}
+
+	// Wait for the Rust volume server to be ready
+	rustEndpoint := fmt.Sprintf("http://127.0.0.1:%d/healthz", rustVolumePort)
+	deadline := time.Now().Add(15 * time.Second)
+	client := &http.Client{Timeout: 1 * time.Second}
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(rustEndpoint)
+		if err == nil {
+			resp.Body.Close()
+			t.Logf("Rust volume server ready on port %d (grpc %d)", rustVolumePort, rustVolumeGrpcPort)
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("rust volume server not ready after 15s (port %d)", rustVolumePort)
+}
+
 // Stop stops the test cluster
 func (c *TestCluster) Stop() {
+	// Stop Rust volume server first
+	if c.rustVolumeCmd != nil && c.rustVolumeCmd.Process != nil {
+		c.rustVolumeCmd.Process.Kill()
+		c.rustVolumeCmd.Wait()
+	}
+
 	if c.cancel != nil {
 		c.cancel()
 	}
@@ -290,25 +351,6 @@ func (c *TestCluster) Stop() {
 			break
 		}
 	}
-}
-
-// waitForS3Ready waits for the S3 service to be ready
-func waitForS3Ready(endpoint string, timeout time.Duration) error {
-	client := &http.Client{Timeout: 1 * time.Second}
-	deadline := time.Now().Add(timeout)
-
-	for time.Now().Before(deadline) {
-		resp, err := client.Get(endpoint)
-		if err == nil {
-			resp.Body.Close()
-			// Wait a bit more to ensure service is fully ready
-			time.Sleep(500 * time.Millisecond)
-			return nil
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	return fmt.Errorf("timeout waiting for S3 service at %s", endpoint)
 }
 
 // Test functions

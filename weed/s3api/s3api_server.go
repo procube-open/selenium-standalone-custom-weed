@@ -25,12 +25,14 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/iam/policy"
 	"github.com/seaweedfs/seaweedfs/weed/iam/sts"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/s3_lifecycle_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/policy_engine"
 	. "github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	util_http_client "github.com/seaweedfs/seaweedfs/weed/util/http/client"
@@ -60,10 +62,20 @@ type S3ApiServerOption struct {
 	BindIp                    string
 	GrpcPort                  int
 	ExternalUrl               string // external URL clients use, for signature verification behind a reverse proxy
+	DefaultFileMode           uint32 // default file permission mode for S3 uploads (e.g. 0660, 0644)
+	CacheSizeMB               int64  // in-memory chunk cache capacity in MB for the shared ReaderCache; 0 disables
 }
+
+// s3ChunkCacheChunkSizeMB is the assumed chunk size (in MiB) used to convert
+// CacheSizeMB into the entry count the in-memory cache accepts. This matches
+// the default -filer.maxMB for all filer/webdav/mini flag sites. It is NOT a
+// hard limit — larger chunks still get cached, this just means the byte budget
+// is approximate when upload-side chunking is configured larger.
+const s3ChunkCacheChunkSizeMB = 4
 
 type S3ApiServer struct {
 	s3_pb.UnimplementedSeaweedS3IamCacheServer
+	s3_lifecycle_pb.UnimplementedSeaweedS3LifecycleInternalServer
 	option                *S3ApiServerOption
 	iam                   *IdentityAccessManagement
 	iamIntegration        *S3IAMIntegration // Advanced IAM integration for JWT authentication
@@ -82,7 +94,22 @@ type S3ApiServer struct {
 	embeddedIam           *EmbeddedIamApi // Embedded IAM API server (when enabled)
 	stsHandlers           *STSHandlers    // STS HTTP handlers for AssumeRoleWithWebIdentity
 	cipher                bool            // encrypt data on volume servers
+	newObjectWriteLock    func(bucket, object string) objectWriteLock
+	// Shared ReaderCache used by the S3 GET streaming path. It lives for the
+	// lifetime of the server so that concurrent and repeat reads share a
+	// single in-flight download per chunk, and so that no per-request
+	// teardown waits on context.Background() fetches. The chunkCache field
+	// is nil in this commit; a follow-up wires in an in-memory chunk cache.
+	readerCache *filer.ReaderCache
 }
+
+type objectWriteLock interface {
+	StopShortLivedLock() error
+}
+
+const (
+	objectWriteLockTTL = 15 * time.Second
+)
 
 func NewS3ApiServer(router *mux.Router, option *S3ApiServerOption) (s3ApiServer *S3ApiServer, err error) {
 	return NewS3ApiServerWithStore(router, option, "")
@@ -168,6 +195,55 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		}
 	}()
 
+	// Shared ReaderCache for the S3 GET streaming path. Keeping this shared
+	// (rather than per-request) avoids the per-request Close(), which would
+	// otherwise wait for background chunk downloads that run on
+	// context.Background() even after the client disconnects.
+	//
+	// The underlying ChunkCache is controlled by option.CacheSizeMB below:
+	//   - CacheSizeMB == 0: a nil *chunk_cache.TieredChunkCache is used (its
+	//     receiver methods are nil-safe). Completed chunks are not deposited
+	//     into a cross-request cache — concurrent readers still share in-flight
+	//     downloads through the ReaderCache's downloaders map, but repeat reads
+	//     refetch from volume servers.
+	//   - CacheSizeMB > 0: a chunk_cache.ChunkCacheInMemory is created and
+	//     wrapped in the ReaderCache, so repeat and concurrent reads hit
+	//     memory. maxEntries is approximated from the byte budget and the
+	//     assumed chunk size (s3ChunkCacheChunkSizeMB), clamped to a small
+	//     floor so tiny caches still function.
+	//
+	// Downloader slots: each slot holds one in-flight / recently-completed
+	// chunk buffer (~4 MiB by default), so this caps both peak memory for
+	// in-flight chunks (s3ReaderCacheDownloaderLimit × chunkSize) and the
+	// global fetch concurrency across all S3 GET requests. WebDAV uses 32
+	// because it typically has a handful of clients; S3 serves many
+	// concurrent readers, so we pick a more generous default here.
+	const s3ReaderCacheDownloaderLimit = 256
+
+	// Negative CacheSizeMB is a misconfiguration; fail fast rather than
+	// silently behaving like 0.
+	if option.CacheSizeMB < 0 {
+		return nil, fmt.Errorf("invalid -s3.cacheCapacityMB %d: must be >= 0", option.CacheSizeMB)
+	}
+	var chunkCache chunk_cache.ChunkCache
+	if option.CacheSizeMB > 0 {
+		// ccache sizes entries by count; convert the configured byte budget
+		// via the assumed chunk size. Clamp to a floor so tiny caches still
+		// function.
+		maxEntries := option.CacheSizeMB / s3ChunkCacheChunkSizeMB
+		if maxEntries < 8 {
+			maxEntries = 8
+		}
+		chunkCache = chunk_cache.NewChunkCacheInMemory(maxEntries)
+		// Log the effective capacity after the floor clamp, not the configured
+		// value — a user passing `-s3.cacheCapacityMB=1` actually gets 8 entries
+		// ≈ 32 MiB because of the floor.
+		glog.V(0).Infof("s3 chunk cache enabled: in-memory, ~%dMB (%d chunks of ~%dMB)", maxEntries*s3ChunkCacheChunkSizeMB, maxEntries, s3ChunkCacheChunkSizeMB)
+	} else {
+		chunkCache = (*chunk_cache.TieredChunkCache)(nil)
+	}
+	readerCache := filer.NewReaderCache(s3ReaderCacheDownloaderLimit, chunkCache, filerClient.GetLookupFileIdFunction())
+
 	s3ApiServer = &S3ApiServer{
 		option:                option,
 		iam:                   iam,
@@ -180,6 +256,22 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		policyEngine:          policyEngine,                           // Initialize bucket policy engine
 		inFlightDataLimitCond: sync.NewCond(new(sync.Mutex)),
 		cipher:                option.Cipher,
+		readerCache:           readerCache,
+	}
+
+	if len(option.Filers) > 0 {
+		objectWriteLockClient := cluster.NewLockClient(option.GrpcDialOption, option.Filers[0])
+		s3ApiServer.newObjectWriteLock = func(bucket, object string) objectWriteLock {
+			lockKey := fmt.Sprintf("s3.object.write:%s", s3ApiServer.toFilerPath(bucket, object))
+			owner := fmt.Sprintf("s3api-%d", s3ApiServer.randomClientId)
+			lock := objectWriteLockClient.NewShortLivedLock(lockKey, owner)
+			if err := lock.AttemptToLock(objectWriteLockTTL); err != nil {
+				// The initial acquisition already succeeded with the default short TTL.
+				// Renewal to a longer TTL is opportunistic to cover slower metadata paths.
+				glog.Warningf("objectWriteLock: failed to extend lock TTL for %s: %v", lockKey, err)
+			}
+			return lock
+		}
 	}
 
 	// Set s3a reference in circuit breaker for upload limiting
@@ -188,6 +280,11 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 	// Pass policy engine to IAM for bucket policy evaluation
 	// This avoids circular dependency by not passing the entire S3ApiServer
 	iam.policyEngine = policyEngine
+
+	// Give the policy engine a way to look up the SSE algorithm that was
+	// stored at CreateMultipartUpload time, so that UploadPart/UploadPartCopy
+	// policy conditions on s3:x-amz-server-side-encryption evaluate correctly.
+	policyEngine.MultipartSSELookup = s3ApiServer.getMultipartSSEAlgorithm
 
 	// Initialize advanced IAM system if config is provided or explicitly enabled
 	if option.IamConfig != "" || option.EnableIam {
@@ -246,6 +343,7 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 				glog.Errorf("fail to load config file %s: %v", option.Config, err)
 			} else {
 				glog.V(1).Infof("Loaded %d identities from config file %s", len(s3ApiServer.iam.identities), option.Config)
+				s3ApiServer.iam.updateCredentialManagerStaticIdentities()
 			}
 		})
 	}
@@ -277,6 +375,7 @@ func NewS3ApiServerWithStore(router *mux.Router, option *S3ApiServerOption, expl
 		filer.IamConfigDirectory + "/policies",
 		filer.IamConfigDirectory + "/service_accounts",
 		filer.IamConfigDirectory + "/groups",
+		filer.IamConfigDirectory + "/oidc-providers",
 	})
 
 	// Start bucket size metrics collection in background
@@ -492,7 +591,7 @@ func (s3a *S3ApiServer) UnifiedPostHandler(w http.ResponseWriter, r *http.Reques
 
 	// 3. Dispatch
 	action := r.Form.Get("Action")
-	if strings.HasPrefix(action, "AssumeRole") {
+	if strings.HasPrefix(action, "AssumeRole") || action == "GetCallerIdentity" || action == "GetFederationToken" {
 		// STS
 		if s3a.stsHandlers == nil {
 			s3err.WriteErrorResponse(w, r, s3err.ErrServiceUnavailable)
@@ -796,7 +895,15 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 		apiRouter.Methods(http.MethodPost).Path("/").Queries("Action", "AssumeRoleWithLDAPIdentity").
 			HandlerFunc(track(s3a.stsHandlers.HandleSTSRequest, "STS-LDAP"))
 
-		glog.V(1).Infof("STS API enabled on S3 port (AssumeRole, AssumeRoleWithWebIdentity, AssumeRoleWithLDAPIdentity)")
+		// GetCallerIdentity - returns caller identity based on SigV4 authentication
+		apiRouter.Methods(http.MethodPost).Path("/").Queries("Action", "GetCallerIdentity").
+			HandlerFunc(track(s3a.stsHandlers.HandleSTSRequest, "STS-GetCallerIdentity"))
+
+		// GetFederationToken - requires SigV4 authentication (long-term IAM user credentials)
+		apiRouter.Methods(http.MethodPost).Path("/").Queries("Action", "GetFederationToken").
+			HandlerFunc(track(s3a.stsHandlers.HandleSTSRequest, "STS-GetFederationToken"))
+
+		glog.V(1).Infof("STS API enabled on S3 port (AssumeRole, AssumeRoleWithWebIdentity, AssumeRoleWithLDAPIdentity, GetCallerIdentity, GetFederationToken)")
 	}
 
 	// Embedded IAM API endpoint
@@ -819,7 +926,7 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 
 			// Action in Query String is handled by explicit STS routes above
 			action := r.URL.Query().Get("Action")
-			if action == "AssumeRole" || action == "AssumeRoleWithWebIdentity" || action == "AssumeRoleWithLDAPIdentity" {
+			if action == "AssumeRole" || action == "AssumeRoleWithWebIdentity" || action == "AssumeRoleWithLDAPIdentity" || action == "GetCallerIdentity" || action == "GetFederationToken" {
 				return false
 			}
 
@@ -1019,4 +1126,53 @@ func (s3a *S3ApiServer) DefaultAllow() bool {
 		return false
 	}
 	return s3a.iam.iamIntegration.DefaultAllow()
+}
+
+// ValidateS3Credential validates an S3 access key / secret key pair.
+// Returns the identity name and identity object on success.
+func (s3a *S3ApiServer) ValidateS3Credential(accessKey, secretKey string) (string, interface{}, error) {
+	if s3a.iam == nil {
+		return "", nil, fmt.Errorf("IAM not configured")
+	}
+	identity, cred, found := s3a.iam.LookupByAccessKey(accessKey)
+	if !found {
+		return "", nil, fmt.Errorf("access key not found")
+	}
+	if cred.SecretKey != secretKey {
+		return "", nil, fmt.Errorf("invalid secret key")
+	}
+	if identity.Disabled {
+		return "", nil, fmt.Errorf("identity is disabled")
+	}
+	if cred.isCredentialExpired() {
+		return "", nil, fmt.Errorf("credential expired")
+	}
+	if cred.Status == "Inactive" {
+		return "", nil, fmt.Errorf("credential is inactive")
+	}
+	return identity.Name, identity, nil
+}
+
+// GetCredentialByAccessKey looks up a credential by access key.
+// Returns the identity name, identity object, and secret key.
+// Used for verifying Iceberg OAuth Bearer tokens with the exact credential
+// that was used to sign the token.
+func (s3a *S3ApiServer) GetCredentialByAccessKey(accessKey string) (string, interface{}, string, error) {
+	if s3a.iam == nil {
+		return "", nil, "", fmt.Errorf("IAM not configured")
+	}
+	identity, cred, found := s3a.iam.LookupByAccessKey(accessKey)
+	if !found {
+		return "", nil, "", fmt.Errorf("access key not found")
+	}
+	if identity.Disabled {
+		return "", nil, "", fmt.Errorf("identity is disabled")
+	}
+	if cred.isCredentialExpired() {
+		return "", nil, "", fmt.Errorf("credential expired")
+	}
+	if cred.Status == "Inactive" {
+		return "", nil, "", fmt.Errorf("credential is inactive")
+	}
+	return identity.Name, identity, cred.SecretKey, nil
 }

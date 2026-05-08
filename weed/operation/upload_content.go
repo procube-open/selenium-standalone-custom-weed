@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -96,6 +97,13 @@ var (
 	once        sync.Once
 )
 
+var uploadRetryableAssignErrList = []string{
+	"transport",
+	"is read only",
+	"failed to write to local disk",
+	"Volume Size ",
+}
+
 // HTTPClient interface for testing
 type HTTPClient interface {
 	Do(req *http.Request) (*http.Response, error)
@@ -127,6 +135,43 @@ func newUploader(httpClient HTTPClient) *Uploader {
 	}
 }
 
+// NewUploaderWithHttpClient creates an Uploader that uses the provided HTTP
+// client instead of the global one. This is used by filer.sync to upload to
+// remote clusters that use different TLS certificates.
+func NewUploaderWithHttpClient(httpClient HTTPClient) *Uploader {
+	return &Uploader{
+		httpClient: httpClient,
+	}
+}
+
+func (uploader *Uploader) uploadWithRetryData(assignFn func() (fileId string, host string, auth security.EncodedJwt, err error), uploadOption *UploadOption, genFileUrlFn func(host, fileId string) string, data []byte) (fileId string, uploadResult *UploadResult, err error) {
+	doUploadFunc := func() error {
+		var host string
+		var auth security.EncodedJwt
+		fileId, host, auth, err = assignFn()
+		if err != nil {
+			return err
+		}
+
+		uploadOption.UploadUrl = genFileUrlFn(host, fileId)
+		uploadOption.Jwt = auth
+
+		uploadResult, err = uploader.retriedUploadData(context.Background(), data, uploadOption)
+		return err
+	}
+
+	if uploadOption.RetryForever {
+		util.RetryUntil("uploadWithRetryForever", doUploadFunc, func(err error) (shouldContinue bool) {
+			glog.V(0).Infof("upload content: %v", err)
+			return true
+		})
+	} else {
+		err = util.MultiRetry("uploadWithRetry", uploadRetryableAssignErrList, doUploadFunc)
+	}
+
+	return
+}
+
 // UploadWithRetry will retry both assigning volume request and uploading content
 // The option parameter does not need to specify UploadUrl and Jwt, which will come from assigning volume.
 func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assignRequest *filer_pb.AssignVolumeRequest, uploadOption *UploadOption, genFileUrlFn func(host, fileId string) string, reader io.Reader) (fileId string, uploadResult *UploadResult, err error, data []byte) {
@@ -143,11 +188,13 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 		glog.V(4).Infof("upload read %d bytes from %s", len(data), uploadOption.SourceUrl)
 	}
 
-	doUploadFunc := func() error {
+	// Tell the master the real chunk size so its effectiveSize accounting
+	// doesn't fall back to the 1 MB DefaultNeedleSizeEstimate per fid.
+	if assignRequest.ExpectedDataSize == 0 {
+		assignRequest.ExpectedDataSize = uint64(len(data))
+	}
 
-		var host string
-		var auth security.EncodedJwt
-
+	fileId, uploadResult, err = uploader.uploadWithRetryData(func() (fileId string, host string, auth security.EncodedJwt, err error) {
 		// grpc assign volume
 		if grpcAssignErr := filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 			resp, assignErr := client.AssignVolume(context.Background(), assignRequest)
@@ -165,26 +212,10 @@ func (uploader *Uploader) UploadWithRetry(filerClient filer_pb.FilerClient, assi
 
 			return nil
 		}); grpcAssignErr != nil {
-			return fmt.Errorf("filerGrpcAddress assign volume: %w", grpcAssignErr)
+			err = fmt.Errorf("filerGrpcAddress assign volume: %w", grpcAssignErr)
 		}
-
-		uploadOption.UploadUrl = genFileUrlFn(host, fileId)
-		uploadOption.Jwt = auth
-
-		var uploadErr error
-		uploadResult, uploadErr = uploader.retriedUploadData(context.Background(), data, uploadOption)
-		return uploadErr
-	}
-	if uploadOption.RetryForever {
-		util.RetryUntil("uploadWithRetryForever", doUploadFunc, func(err error) (shouldContinue bool) {
-			glog.V(0).Infof("upload content: %v", err)
-			return true
-		})
-	} else {
-		uploadErrList := []string{"transport", "is read only"}
-		err = util.MultiRetry("uploadWithRetry", uploadErrList, doUploadFunc)
-	}
-
+		return
+	}, uploadOption, genFileUrlFn, data)
 	return
 }
 
@@ -408,13 +439,32 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 	if post_err != nil {
 		if strings.Contains(post_err.Error(), "connection reset by peer") ||
 			strings.Contains(post_err.Error(), "use of closed network connection") {
-			glog.V(1).InfofCtx(ctx, "repeat error upload request %s: %v", option.UploadUrl, postErr)
+			glog.V(1).InfofCtx(ctx, "repeat error upload request %s: %v", option.UploadUrl, post_err)
 			stats.FilerHandlerCounter.WithLabelValues(stats.RepeatErrorUploadContent).Inc()
-			resp, post_err = uploader.httpClient.Do(req)
-			defer util_http.CloseResponse(resp)
+			// The first attempt already consumed (or partially consumed) the
+			// body, so retrying with the same *http.Request would send 0 bytes
+			// and Go's transport would surface "ContentLength=N with Body
+			// length 0". http.NewRequestWithContext sets GetBody for
+			// *bytes.Reader bodies; use it to attach a fresh body for retry.
+			// If we can't rewind, skip the inner retry and let the outer
+			// retriedUploadData loop reissue the request with a fresh body —
+			// retrying here with a consumed body would mask the original
+			// "connection reset" error with a misleading "Body length 0".
+			if req.GetBody != nil {
+				if newBody, gbErr := req.GetBody(); gbErr == nil {
+					req.Body = newBody
+					resp, post_err = uploader.httpClient.Do(req)
+					defer util_http.CloseResponse(resp)
+				} else {
+					glog.V(1).InfofCtx(ctx, "skip inner retry for %s: GetBody returned %v", option.UploadUrl, gbErr)
+				}
+			} else {
+				glog.V(1).InfofCtx(ctx, "skip inner retry for %s: req.GetBody is nil", option.UploadUrl)
+			}
 		}
 	}
 	if post_err != nil {
+		stats.UploadErrorCounter.WithLabelValues("0").Inc()
 		return nil, fmt.Errorf("upload %s %d bytes to %v: %v", option.Filename, originalDataSize, option.UploadUrl, post_err)
 	}
 	// print("-")
@@ -423,20 +473,24 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 	etag := getEtag(resp)
 	if resp.StatusCode == http.StatusNoContent {
 		ret.ETag = etag
+		ret.ContentMd5 = resp.Header.Get("Content-MD5")
 		return &ret, nil
 	}
 
 	resp_body, ra_err := io.ReadAll(resp.Body)
 	if ra_err != nil {
+		stats.UploadErrorCounter.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
 		return nil, fmt.Errorf("read response body %v: %w", option.UploadUrl, ra_err)
 	}
 
 	unmarshal_err := json.Unmarshal(resp_body, &ret)
 	if unmarshal_err != nil {
+		stats.UploadErrorCounter.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
 		glog.ErrorfCtx(ctx, "unmarshal %s: %v", option.UploadUrl, string(resp_body))
 		return nil, fmt.Errorf("unmarshal %v: %w", option.UploadUrl, unmarshal_err)
 	}
 	if ret.Error != "" {
+		stats.UploadErrorCounter.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
 		return nil, fmt.Errorf("unmarshalled error %v: %v", option.UploadUrl, ret.Error)
 	}
 	ret.ETag = etag

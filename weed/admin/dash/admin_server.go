@@ -23,6 +23,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/plugin_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/schema_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
@@ -542,13 +543,6 @@ func (s *AdminServer) sortBuckets(buckets []S3Bucket, sortBy, sortOrder string) 
 				}
 				return a.CreatedAt.Before(b.CreatedAt)
 			}
-		case "objects":
-			if a.ObjectCount != b.ObjectCount {
-				if desc {
-					return a.ObjectCount > b.ObjectCount
-				}
-				return a.ObjectCount < b.ObjectCount
-			}
 		case "logical_size":
 			if a.LogicalSize != b.LogicalSize {
 				if desc {
@@ -645,14 +639,11 @@ func (s *AdminServer) GetS3Buckets() ([]S3Bucket, error) {
 				// Determine collection name for this bucket
 				collectionName := getCollectionName(filerConfig.FilerGroup, bucketName)
 
-				// Get size and object count from collection data
 				var physicalSize int64
 				var logicalSize int64
-				var objectCount int64
 				if collectionData, exists := collectionMap[collectionName]; exists {
 					physicalSize = collectionData.PhysicalSize
 					logicalSize = collectionData.LogicalSize
-					objectCount = collectionData.FileCount
 				}
 
 				// Get quota information from entry
@@ -694,7 +685,6 @@ func (s *AdminServer) GetS3Buckets() ([]S3Bucket, error) {
 					CreatedAt:          createdAt,
 					LogicalSize:        logicalSize,
 					PhysicalSize:       physicalSize,
-					ObjectCount:        objectCount,
 					LastModified:       lastModified,
 					Quota:              quota,
 					QuotaEnabled:       quotaEnabled,
@@ -749,7 +739,6 @@ func (s *AdminServer) GetBucketDetails(bucketName string) (*BucketDetails, error
 	} else if data, ok := stats[collectionName]; ok {
 		details.Bucket.LogicalSize = data.LogicalSize
 		details.Bucket.PhysicalSize = data.PhysicalSize
-		details.Bucket.ObjectCount = data.FileCount
 	}
 
 	err = s.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
@@ -867,6 +856,24 @@ func (s *AdminServer) DeleteS3Bucket(bucketName string) error {
 	})
 }
 
+// IsStaticUser checks if a user is a static identity by loading the
+// configuration from the credential manager and checking the IsStatic flag.
+func (s *AdminServer) IsStaticUser(username string) bool {
+	if s.credentialManager == nil {
+		return false
+	}
+	s3cfg, err := s.credentialManager.LoadConfiguration(context.Background())
+	if err != nil {
+		return false
+	}
+	for _, ident := range s3cfg.Identities {
+		if ident.Name == username {
+			return ident.IsStatic
+		}
+	}
+	return false
+}
+
 // GetObjectStoreUsers retrieves object store users from identity.json
 func (s *AdminServer) GetObjectStoreUsers(ctx context.Context) ([]ObjectStoreUser, error) {
 	if s.credentialManager == nil {
@@ -890,6 +897,7 @@ func (s *AdminServer) GetObjectStoreUsers(ctx context.Context) ([]ObjectStoreUse
 		user := ObjectStoreUser{
 			Username:    identity.Name,
 			Permissions: identity.Actions,
+			IsStatic:    identity.IsStatic,
 		}
 
 		// Set email from account if available
@@ -943,7 +951,7 @@ func (s *AdminServer) GetClusterMasters() (*ClusterMastersData, error) {
 			leaderCount++
 		}
 
-		masterMap[master.Address] = masterInfo
+		masterMap[masterInfo.Address] = masterInfo
 	}
 
 	// Then, get additional master information from Raft cluster
@@ -955,11 +963,11 @@ func (s *AdminServer) GetClusterMasters() (*ClusterMastersData, error) {
 
 		// Process each raft server
 		for _, server := range resp.ClusterServers {
-			address := server.Address
-			httpAddress := pb.ServerAddress(address).ToHttpAddress()
+			// Raft stores gRPC addresses, convert to HTTP address
+			httpAddress := pb.GrpcAddressToServerAddress(server.Address)
 
 			// Update existing master info or create new one
-			if masterInfo, exists := masterMap[address]; exists {
+			if masterInfo, exists := masterMap[httpAddress]; exists {
 				// Update existing master with raft data
 				masterInfo.IsLeader = server.IsLeader
 				masterInfo.Suffrage = server.Suffrage
@@ -970,7 +978,7 @@ func (s *AdminServer) GetClusterMasters() (*ClusterMastersData, error) {
 					IsLeader: server.IsLeader,
 					Suffrage: server.Suffrage,
 				}
-				masterMap[address] = masterInfo
+				masterMap[httpAddress] = masterInfo
 			}
 
 			if server.IsLeader {
@@ -1646,167 +1654,29 @@ func (as *AdminServer) GetConfigPersistence() *ConfigPersistence {
 	return as.configPersistence
 }
 
-// convertJSONToMaintenanceConfig converts JSON map to protobuf MaintenanceConfig
-func convertJSONToMaintenanceConfig(jsonConfig map[string]interface{}) (*maintenance.MaintenanceConfig, error) {
-	config := &maintenance.MaintenanceConfig{}
-
-	// Helper function to get int32 from interface{}
-	getInt32 := func(key string) (int32, error) {
-		if val, ok := jsonConfig[key]; ok {
-			switch v := val.(type) {
-			case int:
-				return int32(v), nil
-			case int32:
-				return v, nil
-			case int64:
-				return int32(v), nil
-			case float64:
-				return int32(v), nil
-			default:
-				return 0, fmt.Errorf("invalid type for %s: expected number, got %T", key, v)
-			}
-		}
-		return 0, nil
-	}
-
-	// Helper function to get bool from interface{}
-	getBool := func(key string) bool {
-		if val, ok := jsonConfig[key]; ok {
-			if b, ok := val.(bool); ok {
-				return b
-			}
-		}
-		return false
-	}
-
-	var err error
-
-	// Convert basic fields
-	config.Enabled = getBool("enabled")
-
-	if config.ScanIntervalSeconds, err = getInt32("scan_interval_seconds"); err != nil {
-		return nil, err
-	}
-	if config.WorkerTimeoutSeconds, err = getInt32("worker_timeout_seconds"); err != nil {
-		return nil, err
-	}
-	if config.TaskTimeoutSeconds, err = getInt32("task_timeout_seconds"); err != nil {
-		return nil, err
-	}
-	if config.RetryDelaySeconds, err = getInt32("retry_delay_seconds"); err != nil {
-		return nil, err
-	}
-	if config.MaxRetries, err = getInt32("max_retries"); err != nil {
-		return nil, err
-	}
-	if config.CleanupIntervalSeconds, err = getInt32("cleanup_interval_seconds"); err != nil {
-		return nil, err
-	}
-	if config.TaskRetentionSeconds, err = getInt32("task_retention_seconds"); err != nil {
-		return nil, err
-	}
-
-	// Convert policy if present
-	if policyData, ok := jsonConfig["policy"]; ok {
-		if policyMap, ok := policyData.(map[string]interface{}); ok {
-			policy := &maintenance.MaintenancePolicy{}
-
-			if globalMaxConcurrent, err := getInt32FromMap(policyMap, "global_max_concurrent"); err != nil {
-				return nil, err
-			} else {
-				policy.GlobalMaxConcurrent = globalMaxConcurrent
-			}
-
-			if defaultRepeatIntervalSeconds, err := getInt32FromMap(policyMap, "default_repeat_interval_seconds"); err != nil {
-				return nil, err
-			} else {
-				policy.DefaultRepeatIntervalSeconds = defaultRepeatIntervalSeconds
-			}
-
-			if defaultCheckIntervalSeconds, err := getInt32FromMap(policyMap, "default_check_interval_seconds"); err != nil {
-				return nil, err
-			} else {
-				policy.DefaultCheckIntervalSeconds = defaultCheckIntervalSeconds
-			}
-
-			// Convert task policies if present
-			if taskPoliciesData, ok := policyMap["task_policies"]; ok {
-				if taskPoliciesMap, ok := taskPoliciesData.(map[string]interface{}); ok {
-					policy.TaskPolicies = make(map[string]*maintenance.TaskPolicy)
-
-					for taskType, taskPolicyData := range taskPoliciesMap {
-						if taskPolicyMap, ok := taskPolicyData.(map[string]interface{}); ok {
-							taskPolicy := &maintenance.TaskPolicy{}
-
-							taskPolicy.Enabled = getBoolFromMap(taskPolicyMap, "enabled")
-
-							if maxConcurrent, err := getInt32FromMap(taskPolicyMap, "max_concurrent"); err != nil {
-								return nil, err
-							} else {
-								taskPolicy.MaxConcurrent = maxConcurrent
-							}
-
-							if repeatIntervalSeconds, err := getInt32FromMap(taskPolicyMap, "repeat_interval_seconds"); err != nil {
-								return nil, err
-							} else {
-								taskPolicy.RepeatIntervalSeconds = repeatIntervalSeconds
-							}
-
-							if checkIntervalSeconds, err := getInt32FromMap(taskPolicyMap, "check_interval_seconds"); err != nil {
-								return nil, err
-							} else {
-								taskPolicy.CheckIntervalSeconds = checkIntervalSeconds
-							}
-
-							policy.TaskPolicies[taskType] = taskPolicy
-						}
-					}
-				}
-			}
-
-			config.Policy = policy
-		}
-	}
-
-	return config, nil
-}
-
-// Helper functions for map conversion
-func getInt32FromMap(m map[string]interface{}, key string) (int32, error) {
-	if val, ok := m[key]; ok {
-		switch v := val.(type) {
-		case int:
-			return int32(v), nil
-		case int32:
-			return v, nil
-		case int64:
-			return int32(v), nil
-		case float64:
-			return int32(v), nil
-		default:
-			return 0, fmt.Errorf("invalid type for %s: expected number, got %T", key, v)
-		}
-	}
-	return 0, nil
-}
-
-func getBoolFromMap(m map[string]interface{}, key string) bool {
-	if val, ok := m[key]; ok {
-		if b, ok := val.(bool); ok {
-			return b
-		}
-	}
-	return false
-}
-
 type collectionStats struct {
 	PhysicalSize int64
 	LogicalSize  int64
 	FileCount    int64
 }
 
+// ecVolumeCounts combines EC volume counts reported by multiple nodes.
+// Every node holding any shard of an EC volume reports the same file_count
+// (total entries in the replicated .ecx), so we dedupe it per volume id by
+// taking the max — a node that has not yet finished loading .ecx would
+// otherwise pin the aggregate at 0 and zero out the bucket object count.
+// In contrast, a needle delete is recorded locally on the shard holder
+// that served it, so each node reports its own tombstone count and the
+// true delete total is the sum across nodes.
+type ecVolumeCounts struct {
+	collection  string
+	fileCount   uint64
+	deleteCount uint64
+}
+
 func collectCollectionStats(topologyInfo *master_pb.TopologyInfo) map[string]collectionStats {
 	collectionMap := make(map[string]collectionStats)
+	ecVolumeAgg := make(map[uint32]*ecVolumeCounts)
 	for _, dc := range topologyInfo.DataCenterInfos {
 		for _, rack := range dc.RackInfos {
 			for _, node := range rack.DataNodeInfos {
@@ -1832,10 +1702,51 @@ func collectCollectionStats(topologyInfo *master_pb.TopologyInfo) map[string]col
 						}
 						collectionMap[collection] = data
 					}
+					for _, ecShardInfo := range diskInfo.EcShardInfos {
+						collection := ecShardInfo.Collection
+						if collection == "" {
+							collection = "default"
+						}
+						shards := erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(ecShardInfo)
+						data := collectionMap[collection]
+						data.PhysicalSize += int64(shards.TotalSize())
+						data.LogicalSize += int64(shards.MinusParityShards().TotalSize())
+						collectionMap[collection] = data
+
+						// fileCount is volume-wide (same .ecx on every shard
+						// holder) so take the max to dedupe — a node that has
+						// not yet finished loading .ecx reports 0 and must not
+						// pin the aggregate. deleteCount is node-local and is
+						// summed across shard holders.
+						agg, ok := ecVolumeAgg[ecShardInfo.Id]
+						if !ok {
+							agg = &ecVolumeCounts{collection: collection}
+							ecVolumeAgg[ecShardInfo.Id] = agg
+						}
+						if ecShardInfo.FileCount > agg.fileCount {
+							agg.fileCount = ecShardInfo.FileCount
+						}
+						agg.deleteCount += ecShardInfo.DeleteCount
+					}
 				}
 			}
 		}
 	}
+
+	// Fold EC per-volume counts into the collection totals. fileCount is
+	// deduped via max across every node reporting shards for the volume;
+	// deleteCount is summed across the same nodes.
+	for vid, agg := range ecVolumeAgg {
+		data := collectionMap[agg.collection]
+		if agg.fileCount >= agg.deleteCount {
+			data.FileCount += int64(agg.fileCount - agg.deleteCount)
+		} else {
+			glog.Warningf("ec volume %d in collection %q: summed delete_count=%d exceeds file_count=%d; skipping object count",
+				vid, agg.collection, agg.deleteCount, agg.fileCount)
+		}
+		collectionMap[agg.collection] = data
+	}
+
 	return collectionMap
 }
 

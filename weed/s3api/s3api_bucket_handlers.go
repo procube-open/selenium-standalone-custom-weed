@@ -7,6 +7,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"sort"
@@ -19,6 +20,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3bucket"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/lifecycle_xml"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
@@ -147,14 +149,6 @@ func isBucketOwnedByIdentity(entry *filer_pb.Entry, identity *Identity) bool {
 	}
 
 	return true
-}
-
-// isBucketVisibleToIdentity is kept for backward compatibility with tests.
-// It checks if a bucket should be visible based on ownership only.
-// Deprecated: Use isBucketOwnedByIdentity instead. The ListBucketsHandler
-// now uses OR logic: a bucket is visible if user owns it OR has List permission.
-func isBucketVisibleToIdentity(entry *filer_pb.Entry, identity *Identity) bool {
-	return isBucketOwnedByIdentity(entry, identity)
 }
 
 func (s3a *S3ApiServer) PutBucketHandler(w http.ResponseWriter, r *http.Request) {
@@ -411,6 +405,17 @@ func (s3a *S3ApiServer) DeleteBucketHandler(w http.ResponseWriter, r *http.Reque
 	// Clean up bucket-related caches, locks, and metrics after successful deletion
 	s3a.invalidateBucketConfigCache(bucket)
 	stats_collect.DeleteBucketMetrics(bucket)
+
+	// Prune identity actions that were scoped to this bucket via s3.configure.
+	// Use a bounded background context so the cleanup survives client disconnect;
+	// the bucket is already gone and this is best-effort bookkeeping.
+	if s3a.iam != nil {
+		pruneCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if _, err := s3a.iam.PruneBucketFromConfiguration(pruneCtx, bucket); err != nil {
+			glog.Errorf("DeleteBucketHandler: failed to prune IAM actions for bucket %s: %v", bucket, err)
+		}
+		cancel()
+	}
 
 	s3err.WriteEmptyResponse(w, r, http.StatusNoContent)
 }
@@ -815,6 +820,14 @@ func (s3a *S3ApiServer) GetBucketLifecycleConfigurationHandler(w http.ResponseWr
 		s3err.WriteErrorResponse(w, r, err)
 		return
 	}
+	if lifecycleXML, transitionMinimumObjectSize, found, errCode := s3a.getStoredBucketLifecycleConfiguration(bucket); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	} else if found {
+		w.Header().Set(bucketLifecycleTransitionMinimumObjectSizeHeader, transitionMinimumObjectSize)
+		writeSuccessResponseXMLBytes(w, r, lifecycleXML)
+		return
+	}
 	// ReadFilerConfFromFilers provides multi-filer failover
 	fc, err := filer.ReadFilerConfFromFilers(s3a.option.Filers, s3a.option.GrpcDialOption, nil)
 	if err != nil {
@@ -828,7 +841,7 @@ func (s3a *S3ApiServer) GetBucketLifecycleConfigurationHandler(w http.ResponseWr
 		return
 	}
 
-	response := Lifecycle{}
+	response := lifecycle_xml.Lifecycle{}
 	// Sort locationPrefixes to ensure consistent ordering of lifecycle rules
 	var locationPrefixes []string
 	for locationPrefix := range ttls {
@@ -847,14 +860,17 @@ func (s3a *S3ApiServer) GetBucketLifecycleConfigurationHandler(w http.ResponseWr
 		if !found {
 			continue
 		}
-		response.Rules = append(response.Rules, Rule{
+		response.Rules = append(response.Rules, lifecycle_xml.Rule{
 			ID:         prefix,
-			Status:     Enabled,
-			Prefix:     Prefix{val: prefix, set: true},
-			Expiration: Expiration{Days: days, set: true},
+			Status:     lifecycle_xml.Enabled,
+			Prefix:     lifecycle_xml.NewPrefix(prefix),
+			Expiration: lifecycle_xml.NewExpirationDays(days),
 		})
 	}
 
+	if len(response.Rules) > 0 {
+		w.Header().Set(bucketLifecycleTransitionMinimumObjectSizeHeader, defaultLifecycleTransitionMinimumObjectSize)
+	}
 	writeSuccessResponseXML(w, r, response)
 }
 
@@ -892,8 +908,21 @@ func (s3a *S3ApiServer) PutBucketLifecycleConfigurationHandler(w http.ResponseWr
 		return
 	}
 
-	lifeCycleConfig := Lifecycle{}
-	if err := xmlDecoder(r.Body, &lifeCycleConfig, r.ContentLength); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBucketLifecycleConfigurationSize)
+	lifecycleXML, err := io.ReadAll(r.Body)
+	if err != nil {
+		glog.Warningf("PutBucketLifecycleConfigurationHandler read body: %s", err)
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrEntityTooLarge)
+			return
+		}
+		s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRequest)
+		return
+	}
+
+	lifeCycleConfig := lifecycle_xml.Lifecycle{}
+	if err := xmlDecoder(bytes.NewReader(lifecycleXML), &lifeCycleConfig, int64(len(lifecycleXML))); err != nil {
 		glog.Warningf("PutBucketLifecycleConfigurationHandler xml decode: %s", err)
 		s3err.WriteErrorResponse(w, r, s3err.ErrMalformedXML)
 		return
@@ -927,23 +956,66 @@ func (s3a *S3ApiServer) PutBucketLifecycleConfigurationHandler(w http.ResponseWr
 	collectionTtls := fc.GetCollectionTtls(collectionName)
 	changed := false
 
+	// Check whether the bucket has versioning enabled. Versioned buckets must
+	// NOT use the TTL fast-path because:
+	//  1. TTL volumes expire as a unit, destroying all data — including
+	//     noncurrent versions that should be preserved.
+	//  2. Filer-backend TTL (RocksDB compaction, Redis expire) removes entries
+	//     without triggering chunk deletion, leaving orphaned volume data.
+	//  3. On AWS S3, Expiration.Days on a versioned bucket creates a delete
+	//     marker — it does not delete data. TTL has no such nuance.
+	// For versioned buckets the lifecycle worker handles all rule evaluation
+	// at scan time, which correctly operates on individual versions.
+	bucketVersioning, versioningErr := s3a.getBucketVersioningStatus(bucket)
+	if versioningErr != s3err.ErrNone {
+		// Fail closed: if we cannot determine versioning status, treat the
+		// bucket as versioned to avoid creating TTL entries that would
+		// destroy noncurrent versions.
+		glog.V(1).Infof("PutBucketLifecycleConfigurationHandler: could not determine versioning status for %s (err %v), skipping TTL fast-path", bucket, versioningErr)
+	}
+	isVersioned := versioningErr != s3err.ErrNone ||
+		bucketVersioning == s3_constants.VersioningEnabled ||
+		bucketVersioning == s3_constants.VersioningSuspended
+
 	for _, rule := range lifeCycleConfig.Rules {
-		if rule.Status != Enabled {
+		if rule.Status != lifecycle_xml.Enabled {
 			continue
 		}
-		var rulePrefix string
-		switch {
-		case rule.Filter.Prefix.set:
-			rulePrefix = rule.Filter.Prefix.val
-		case rule.Prefix.set:
-			rulePrefix = rule.Prefix.val
-		case !rule.Expiration.Date.IsZero() || rule.Transition.Days > 0 || !rule.Transition.Date.IsZero():
+		// Reject Transition rules — they require storage class migration
+		// infrastructure that does not exist yet.
+		if rule.Transition.Set() || rule.NoncurrentVersionTransition.Set() {
 			s3err.WriteErrorResponse(w, r, s3err.ErrNotImplemented)
 			return
 		}
 
+		if isVersioned {
+			continue // all rules evaluated by lifecycle worker at scan time
+		}
+
+		var rulePrefix string
+		switch {
+		case rule.Filter.AndSet():
+			rulePrefix = rule.Filter.And.Prefix.Val()
+		case rule.Filter.Prefix.Set():
+			rulePrefix = rule.Filter.Prefix.Val()
+		case rule.Prefix.Set():
+			rulePrefix = rule.Prefix.Val()
+		}
+
+		// Only create filer.conf TTL entries for simple Expiration.Days rules
+		// with prefix-only filters (the fast path handled by RocksDB compaction
+		// filter). Rules with tag or size filters must be evaluated at scan time
+		// by the lifecycle worker, because TTL applies to all objects under the
+		// prefix regardless of tags or size.
 		if rule.Expiration.Days == 0 {
 			continue
+		}
+		hasTagOrSizeFilter := rule.Filter.TagSet() ||
+			rule.Filter.ObjectSizeGreaterThan > 0 || rule.Filter.ObjectSizeLessThan > 0 ||
+			(rule.Filter.AndSet() && (len(rule.Filter.And.Tags) > 0 ||
+				rule.Filter.And.ObjectSizeGreaterThan > 0 || rule.Filter.And.ObjectSizeLessThan > 0))
+		if hasTagOrSizeFilter {
+			continue // evaluated by lifecycle worker at scan time
 		}
 		locationPrefix := fmt.Sprintf("%s/%s/%s", s3a.option.BucketsPath, bucket, rulePrefix)
 		locConf := &filer_pb.FilerConf_PathConf{
@@ -980,12 +1052,17 @@ func (s3a *S3ApiServer) PutBucketLifecycleConfigurationHandler(w http.ResponseWr
 			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 		}
 		if err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-			return filer.SaveInsideFiler(client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, buf.Bytes())
+			return filer.SaveInsideFiler(context.Background(), client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, buf.Bytes())
 		}); err != nil {
 			glog.Errorf("PutBucketLifecycleConfigurationHandler save config inside filer: %s", err)
 			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 			return
 		}
+	}
+
+	if errCode := s3a.storeBucketLifecycleConfiguration(bucket, lifecycleXML, r.Header.Get(bucketLifecycleTransitionMinimumObjectSizeHeader)); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
 	}
 
 	writeSuccessResponseEmpty(w, r)
@@ -1030,12 +1107,17 @@ func (s3a *S3ApiServer) DeleteBucketLifecycleHandler(w http.ResponseWriter, r *h
 			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 		}
 		if err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-			return filer.SaveInsideFiler(client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, buf.Bytes())
+			return filer.SaveInsideFiler(context.Background(), client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, buf.Bytes())
 		}); err != nil {
 			glog.Errorf("DeleteBucketLifecycleHandler save config inside filer: %s", err)
 			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
 			return
 		}
+	}
+
+	if errCode := s3a.clearStoredBucketLifecycleConfiguration(bucket); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
 	}
 
 	s3err.WriteEmptyResponse(w, r, http.StatusNoContent)

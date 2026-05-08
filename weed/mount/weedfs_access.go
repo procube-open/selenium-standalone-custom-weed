@@ -40,7 +40,13 @@ func (wfs *WFS) Access(cancel <-chan struct{}, input *fuse.AccessIn) (code fuse.
 	if entry == nil || entry.Attributes == nil {
 		return fuse.EIO
 	}
-	if hasAccess(input.Uid, input.Gid, entry.Attributes.Uid, entry.Attributes.Gid, entry.Attributes.FileMode, input.Mask) {
+	// Map entry uid/gid from filer-space to local-space so the permission
+	// check compares like with like (caller uid/gid from FUSE are local).
+	fileUid, fileGid := entry.Attributes.Uid, entry.Attributes.Gid
+	if wfs.option.UidGidMapper != nil {
+		fileUid, fileGid = wfs.option.UidGidMapper.FilerToLocal(fileUid, fileGid)
+	}
+	if hasAccess(input.Uid, input.Gid, fileUid, fileGid, entry.Attributes.FileMode, input.Mask) {
 		return fuse.OK
 	}
 	return fuse.EACCES
@@ -63,12 +69,11 @@ func hasAccess(callerUid, callerGid, fileUid, fileGid uint32, perm uint32, mask 
 	if !isMember {
 		groupIDs, err := lookupSupplementaryGroupIDs(callerUid)
 		if err != nil {
-			// Cannot determine group membership; require both group and
-			// other permission classes to satisfy the mask so we never
-			// overgrant when the lookup fails.
-			groupMatch := ((perm >> 3) & mask) == mask
-			otherMatch := (perm & mask) == mask
-			return groupMatch && otherMatch
+			// Cannot determine supplementary group membership.
+			// Fall through to "other" permission check since we already
+			// know the caller is not the owner (checked above) and not
+			// in the primary group.
+			return (perm & mask) == mask
 		}
 		fileGidStr := strconv.Itoa(int(fileGid))
 		for _, gidStr := range groupIDs {
@@ -84,6 +89,19 @@ func hasAccess(callerUid, callerGid, fileUid, fileGid uint32, perm uint32, mask 
 	}
 
 	return (perm & mask) == mask
+}
+
+// checkStickyBit enforces the POSIX sticky-bit rule: when a directory has the
+// sticky bit set, only the file owner, the directory owner, or root may
+// delete or rename entries within it.
+func checkStickyBit(dirMode, dirUid, targetUid, callerUid uint32) fuse.Status {
+	if dirMode&0o1000 == 0 {
+		return fuse.OK
+	}
+	if callerUid == 0 || callerUid == dirUid || callerUid == targetUid {
+		return fuse.OK
+	}
+	return fuse.EPERM
 }
 
 // openFlagsToAccessMask converts open(2) flags to an access permission mask.

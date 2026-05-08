@@ -2,6 +2,7 @@
 vendor
 tags
 *.swp
+.claude/
 ### OSX template
 .DS_Store
 .AppleDouble
@@ -143,3 +144,4 @@ test/s3/iam/.test_env
 weed_bin
 telemetry/server/telemetry-server
 .aider*
+/seaweed-volume/docs

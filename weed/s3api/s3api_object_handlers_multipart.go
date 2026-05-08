@@ -180,6 +180,11 @@ func (s3a *S3ApiServer) CompleteMultipartUploadHandler(w http.ResponseWriter, r 
 		w.Header().Set("x-amz-version-id", *response.VersionId)
 	}
 
+	// Set composite checksum header if present
+	if response.ChecksumHeaderName != "" && response.ChecksumValue != "" {
+		w.Header().Set(response.ChecksumHeaderName, response.ChecksumValue)
+	}
+
 	stats_collect.RecordBucketActiveTime(bucket)
 	stats_collect.S3UploadedObjectsCounter.WithLabelValues(bucket).Inc()
 
@@ -447,7 +452,7 @@ func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Requ
 	glog.V(2).Infof("PutObjectPart: bucket=%s, object=%s, uploadId=%s, partNumber=%d, size=%d",
 		bucket, object, uploadID, partID, r.ContentLength)
 
-	etag, errCode, sseMetadata := s3a.putToFiler(r, filePath, dataReader, bucket, partID)
+	etag, errCode, sseMetadata := s3a.putToFiler(r, filePath, dataReader, bucket, "", partID, nil)
 	if errCode != s3err.ErrNone {
 		glog.Errorf("PutObjectPart: putToFiler failed with error code %v for bucket=%s, object=%s, partNumber=%d",
 			errCode, bucket, object, partID)
@@ -469,6 +474,25 @@ func (s3a *S3ApiServer) PutObjectPartHandler(w http.ResponseWriter, r *http.Requ
 
 func (s3a *S3ApiServer) genUploadsFolder(bucket string) string {
 	return fmt.Sprintf("%s/%s", s3a.bucketDir(bucket), s3_constants.MultipartUploadsFolder)
+}
+
+// getMultipartSSEAlgorithm returns the canonical SSE algorithm ("AES256" or
+// "aws:kms") that was stored when the multipart upload was initiated, or ""
+// if the upload entry is not found or had no SSE. It is used by the bucket
+// policy engine to evaluate s3:x-amz-server-side-encryption conditions for
+// UploadPart and UploadPartCopy, which do not re-send the SSE header.
+func (s3a *S3ApiServer) getMultipartSSEAlgorithm(bucket, uploadID string) string {
+	entry, err := s3a.getEntry(s3a.genUploadsFolder(bucket), uploadID)
+	if err != nil || entry == nil || entry.Extended == nil {
+		return ""
+	}
+	if _, ok := entry.Extended[s3_constants.SeaweedFSSSEKMSKeyID]; ok {
+		return "aws:kms"
+	}
+	if _, ok := entry.Extended[s3_constants.SeaweedFSSSES3Encryption]; ok {
+		return "AES256"
+	}
+	return ""
 }
 
 func (s3a *S3ApiServer) genPartUploadPath(bucket, uploadID string, partID int) string {
